@@ -22,18 +22,21 @@ from schedule import calc_plan_shifts, weekday_name_ru, days_in_month
 
 # ─── Цветовая палитра (RGB 0-1) ───────────────────────────────────────────────
 
-C_PURPLE      = {"red": 0.427, "green": 0.369, "blue": 0.651}   # тёмно-фиолетовый — шапка колонок
-C_PURPLE_LITE = {"red": 0.851, "green": 0.824, "blue": 0.914}   # светло-фиолетовый — заголовок раздела
-C_BLUE_LITE   = {"red": 0.812, "green": 0.886, "blue": 0.953}   # голубой — итоговая строка
-C_WEEKEND     = {"red": 1.000, "green": 0.949, "blue": 0.800}   # жёлтый — выходные дни
-C_WEEKEND_HDR = {"red": 0.780, "green": 0.651, "blue": 0.392}   # тёмно-жёлтый — вых. в заголовке
-C_REPLACE     = {"red": 0.937, "green": 0.894, "blue": 0.988}   # сиреневый — строки замены
-C_FIRED       = {"red": 1.000, "green": 0.800, "blue": 0.800}   # розовый — уволенные
-C_WHITE       = {"red": 1.000, "green": 1.000, "blue": 1.000}
-C_WHITE_TEXT  = {"red": 1.000, "green": 1.000, "blue": 1.000}
-C_DARK_TEXT   = {"red": 0.133, "green": 0.133, "blue": 0.133}
-C_GREY_BORDER = {"red": 0.700, "green": 0.700, "blue": 0.700}
+# ─── Цветовая палитра (RGB 0-1) ───────────────────────────────────────────────
 
+C_HEADER_BLUE   = {"red": 0.365, "green": 0.600, "blue": 0.800}   # основная синяя шапка
+C_HEADER_DARK   = {"red": 0.290, "green": 0.510, "blue": 0.710}   # более тёмный синий
+C_PURPLE_TITLE  = {"red": 0.533, "green": 0.459, "blue": 0.761}   # фиолетовый блок месяца
+C_SECTION_LITE  = {"red": 0.914, "green": 0.882, "blue": 0.961}   # светлый заголовок раздела
+C_TOTAL_LITE    = {"red": 0.824, "green": 0.906, "blue": 0.980}   # итоговая строка
+C_WEEKEND       = {"red": 0.992, "green": 0.929, "blue": 0.780}   # мягкий жёлтый
+C_WEEKEND_HDR   = {"red": 0.902, "green": 0.792, "blue": 0.490}   # заголовок выходных
+C_REPLACE       = {"red": 0.937, "green": 0.894, "blue": 0.988}   # строки замены
+C_FIRED         = {"red": 1.000, "green": 0.800, "blue": 0.800}   # уволенные
+C_WHITE         = {"red": 1.000, "green": 1.000, "blue": 1.000}
+C_WHITE_TEXT    = {"red": 1.000, "green": 1.000, "blue": 1.000}
+C_DARK_TEXT     = {"red": 0.133, "green": 0.133, "blue": 0.133}
+C_GRID          = {"red": 0.780, "green": 0.780, "blue": 0.780}
 
 # ─── Подключение ──────────────────────────────────────────────────────────────
 
@@ -114,9 +117,12 @@ def build_sheet(year: int, month: int):
         "sections":  [],
     }
 
-    # ── Заголовок листа (строка 1) ──
+        # ── Заголовок листа (строка 1) ──
     title_row = [""] * n_cols
-    title_row[0] = f"{MONTH_NAMES_RU[month]} {year}"
+    title_start = max(8, 6 + total_days // 3)
+    if title_start >= n_cols:
+        title_start = 0
+    title_row[title_start] = f"{MONTH_NAMES_RU[month]} {year}"
     all_data.append(title_row)
     all_data.append([""] * n_cols)   # пустая строка-отступ
     current_row += 2
@@ -290,85 +296,125 @@ def _format_sheet(ws, layout: dict, total_days: int, year: int, month: int):
         if date(year, month, d).weekday() in (5, 6)  # сб=5, вс=6
     ]
 
+    # ── 0. Базовый белый фон на весь лист ──
+    reqs += [
+        _fmt(sid, 0, 300, 0, n_cols,
+             bg=C_WHITE, fg=C_DARK_TEXT, halign="CENTER", valign="MIDDLE"),
+    ]
+
     # ── 1. Строка-заголовок листа ──
-    tr = layout["title_row"] - 1   # 0-based
+    tr = layout["title_row"] - 1
+
+    title_start = max(8, 6 + total_days // 3)
+    title_end = min(title_start + 4, n_cols)
+
     reqs += [
         _fmt(sid, tr, tr+1, 0, n_cols,
-             bg=C_PURPLE, bold=True, font_size=13, fg=C_WHITE_TEXT, halign="CENTER", valign="MIDDLE"),
-        _merge(sid, tr, tr+1, 0, n_cols),
-        _row_height(sid, tr, tr+1, 38),
+             bg=C_WHITE, fg=C_DARK_TEXT, halign="LEFT", valign="MIDDLE"),
+        _row_height(sid, tr, tr+1, 34),
     ]
+
+    if title_start < title_end:
+        reqs += [
+            _fmt(sid, tr, tr+1, title_start, title_end,
+                 bg=C_PURPLE_TITLE, bold=True, font_size=12, fg=C_WHITE_TEXT,
+                 halign="CENTER", valign="MIDDLE", wrap="WRAP"),
+            _merge(sid, tr, tr+1, title_start, title_end),
+            _outline(sid, tr, tr+1, title_start, title_end),
+        ]
 
     # ── 2. Секции ──
     for sec in layout["sections"]:
 
-        # Заголовок раздела (Подразделение: …)
+        # Заголовок раздела
         if sec["section_header_row"]:
             r = sec["section_header_row"] - 1
             reqs += [
                 _fmt(sid, r, r+1, 0, n_cols,
-                     bg=C_PURPLE_LITE, bold=True, font_size=11, halign="CENTER", valign="MIDDLE"),
+                     bg=C_SECTION_LITE, bold=True, font_size=11,
+                     fg=C_DARK_TEXT, halign="LEFT", valign="MIDDLE", wrap="WRAP"),
                 _merge(sid, r, r+1, 0, n_cols),
-                _row_height(sid, r, r+1, 32),
+                _row_height(sid, r, r+1, 28),
+                _outline(sid, r, r+1, 0, n_cols),
             ]
 
-        # Строка номеров дней (col_header_row)
+        # Строка названий колонок
         chr_ = sec["col_header_row"] - 1
         reqs += [
             _fmt(sid, chr_, chr_+1, 0, n_cols,
-                 bg=C_PURPLE, bold=True, fg=C_WHITE_TEXT, halign="CENTER", valign="MIDDLE"),
-            # ФИО/Номер/Должность — выравнивание по левому краю
+                 bg=C_HEADER_BLUE, bold=True, fg=C_WHITE_TEXT,
+                 halign="CENTER", valign="MIDDLE", wrap="WRAP"),
             _fmt(sid, chr_, chr_+1, 0, 3,
-                 bg=C_PURPLE, bold=True, fg=C_WHITE_TEXT, halign="LEFT"),
-            _row_height(sid, chr_, chr_+1, 28),
+                 bg=C_HEADER_BLUE, bold=True, fg=C_WHITE_TEXT,
+                 halign="LEFT", valign="MIDDLE", wrap="WRAP"),
+            _row_height(sid, chr_, chr_+1, 30),
+            _outline(sid, chr_, chr_+1, 0, n_cols),
         ]
-        # Выходные в строке заголовка — другой оттенок
-        for wc in weekend_cols:
-            reqs.append(_fmt(sid, chr_, chr_+1, wc, wc+1,
-                             bg=C_WEEKEND_HDR, bold=True, fg=C_WHITE_TEXT, halign="CENTER"))
 
-        # Строка дней недели (dow_row)
+        for wc in weekend_cols:
+            reqs.append(
+                _fmt(sid, chr_, chr_+1, wc, wc+1,
+                     bg=C_WEEKEND_HDR, bold=True, fg=C_WHITE_TEXT,
+                     halign="CENTER", valign="MIDDLE", wrap="WRAP")
+            )
+
+        # Строка дней недели
         dwr = sec["dow_row"] - 1
         reqs += [
             _fmt(sid, dwr, dwr+1, 0, n_cols,
-                 bg=C_PURPLE, bold=True, fg=C_WHITE_TEXT, halign="CENTER"),
+                 bg=C_WHITE, bold=True, fg=C_DARK_TEXT,
+                 halign="CENTER", valign="MIDDLE"),
             _row_height(sid, dwr, dwr+1, 22),
         ]
+
         for wc in weekend_cols:
-            reqs.append(_fmt(sid, dwr, dwr+1, wc, wc+1,
-                             bg=C_WEEKEND_HDR, bold=True, fg=C_WHITE_TEXT, halign="CENTER"))
+            reqs.append(
+                _fmt(sid, dwr, dwr+1, wc, wc+1,
+                     bg=C_WEEKEND, bold=True, fg=C_DARK_TEXT,
+                     halign="CENTER", valign="MIDDLE")
+            )
 
         # Строки данных
         ds = sec["data_start"] - 1
-        de = sec["data_end"]        # уже +1 (exclusive)
+        de = sec["data_end"]  # exclusive
         if ds < de:
             reqs += [
-                # Весь блок данных — белый, выравнивание по центру
                 _fmt(sid, ds, de, 0, n_cols,
-                     bg=C_WHITE, bold=False, halign="CENTER", valign="MIDDLE"),
-                # ФИО, Номер, Должность — по левому краю
-                _fmt(sid, ds, de, 0, 3,
-                     bg=C_WHITE, halign="LEFT"),
-                _row_height(sid, ds, de, 21),
+                     bg=C_WHITE, bold=False, fg=C_DARK_TEXT,
+                     halign="CENTER", valign="MIDDLE"),
+                _fmt(sid, ds, de, 0, 1,
+                     bg=C_WHITE, halign="LEFT", valign="MIDDLE"),
+                _fmt(sid, ds, de, 2, 3,
+                     bg=C_WHITE, halign="LEFT", valign="MIDDLE"),
+                _row_height(sid, ds, de, 22),
             ]
-            # Выходные дни — жёлтые
+
             for wc in weekend_cols:
                 reqs.append(_fmt(sid, ds, de, wc, wc+1, bg=C_WEEKEND))
 
-        # Строки замены — светло-сиреневые
+        # Строки замены
         for rep_row in sec.get("replacement_rows", []):
             rr = rep_row - 1
             reqs += [
-                _fmt(sid, rr, rr+1, 0, n_cols, bg=C_REPLACE),
-                _fmt(sid, rr, rr+1, 0, 3, bg=C_REPLACE, halign="LEFT"),
+                _fmt(sid, rr, rr+1, 0, n_cols,
+                     bg=C_REPLACE, fg=C_DARK_TEXT, halign="CENTER", valign="MIDDLE"),
+                _fmt(sid, rr, rr+1, 0, 1,
+                     bg=C_REPLACE, halign="LEFT", valign="MIDDLE"),
+                _fmt(sid, rr, rr+1, 2, 3,
+                     bg=C_REPLACE, halign="LEFT", valign="MIDDLE"),
             ]
 
         # Итоговая строка
         totr = sec["total_row"] - 1
         reqs += [
             _fmt(sid, totr, totr+1, 0, n_cols,
-                 bg=C_BLUE_LITE, bold=True, halign="CENTER", valign="MIDDLE"),
+                 bg=C_TOTAL_LITE, bold=True, fg=C_DARK_TEXT,
+                 halign="CENTER", valign="MIDDLE"),
+            _fmt(sid, totr, totr+1, 0, 3,
+                 bg=C_TOTAL_LITE, bold=True, fg=C_DARK_TEXT,
+                 halign="LEFT", valign="MIDDLE"),
             _row_height(sid, totr, totr+1, 24),
+            _outline(sid, totr, totr+1, 0, n_cols),
         ]
 
     # ── 3. Границы ──
@@ -376,57 +422,63 @@ def _format_sheet(ws, layout: dict, total_days: int, year: int, month: int):
         (s["total_row"] for s in layout["sections"] if s.get("total_row")),
         default=50
     )
-    reqs.append(_borders(sid, 0, last_row, 0, n_cols))
+    reqs.append(_borders_light(sid, 0, last_row, 0, n_cols))
 
     # ── 4. Ширина колонок ──
     col_widths = [
-        (0, 1, 175),   # ФИО
-        (1, 2, 115),   # Номер
-        (2, 3, 115),   # Должность
-        (3, 4, 52),    # График
-        (4, 5, 58),    # План
-        (5, 6, 58),    # Факт/часы
+        (0, 1, 190),   # ФИО
+        (1, 2, 120),   # Номер
+        (2, 3, 130),   # Должность
+        (3, 4, 60),    # График
+        (4, 5, 90),    # План
+        (5, 6, 90),    # Факт/часы
     ]
     for d in range(1, total_days + 1):
-        col_widths.append((5+d, 6+d, 26))    # дни
-    col_widths.append((6+total_days, 6+total_days+1, 115))   # Удержание
-    col_widths.append((6+total_days+1, 6+total_days+2, 80))  # Аванс
+        col_widths.append((5+d, 6+d, 30))  # дни
+    col_widths.append((6+total_days, 6+total_days+1, 110))  # Удержание
+    col_widths.append((6+total_days+1, 6+total_days+2, 95)) # Аванс
 
     for cs, ce, px in col_widths:
         reqs.append({
             "updateDimensionProperties": {
-                "range": {"sheetId": sid, "dimension": "COLUMNS",
-                          "startIndex": cs, "endIndex": ce},
+                "range": {
+                    "sheetId": sid,
+                    "dimension": "COLUMNS",
+                    "startIndex": cs,
+                    "endIndex": ce
+                },
                 "properties": {"pixelSize": px},
                 "fields": "pixelSize",
             }
         })
 
-    # ── 5. Заморозить первые 6 колонок ──
+    # ── 5. Заморозка ──
     reqs.append({
         "updateSheetProperties": {
             "properties": {
                 "sheetId": sid,
-                "gridProperties": {"frozenColumnCount": 6},
+                "gridProperties": {
+                    "frozenColumnCount": 6,
+                    "frozenRowCount": 6,
+                },
             },
-            "fields": "gridProperties.frozenColumnCount",
+            "fields": "gridProperties.frozenColumnCount,gridProperties.frozenRowCount",
         }
     })
 
-    # ── Отправка ──
     ws.spreadsheet.batch_update({"requests": reqs})
-
 
 # ─── Хелперы для Sheets API requests ─────────────────────────────────────────
 
 def _fmt(sid: int, r0: int, r1: int, c0: int, c1: int,
          bg=None, bold: bool = None, fg=None,
-         font_size: int = None, halign: str = None, valign: str = None) -> dict:
+         font_size: int = None, halign: str = None,
+         valign: str = None, wrap: str = None) -> dict:
     fmt = {}
-    fields = []
+
     if bg is not None:
         fmt["backgroundColor"] = bg
-        fields.append("backgroundColor")
+
     tf = {}
     if bold is not None:
         tf["bold"] = bold
@@ -436,24 +488,27 @@ def _fmt(sid: int, r0: int, r1: int, c0: int, c1: int,
         tf["fontSize"] = font_size
     if tf:
         fmt["textFormat"] = tf
-        fields.append("textFormat")
+
     if halign is not None:
         fmt["horizontalAlignment"] = halign
-        fields.append("horizontalAlignment")
     if valign is not None:
         fmt["verticalAlignment"] = valign
-        fields.append("verticalAlignment")
+    if wrap is not None:
+        fmt["wrapStrategy"] = wrap
+
     return {
         "repeatCell": {
-            "range": {"sheetId": sid,
-                      "startRowIndex": r0, "endRowIndex": r1,
-                      "startColumnIndex": c0, "endColumnIndex": c1},
+            "range": {
+                "sheetId": sid,
+                "startRowIndex": r0,
+                "endRowIndex": r1,
+                "startColumnIndex": c0,
+                "endColumnIndex": c1
+            },
             "cell": {"userEnteredFormat": fmt},
             "fields": "userEnteredFormat",
         }
     }
-
-
 def _merge(sid: int, r0: int, r1: int, c0: int, c1: int) -> dict:
     return {
         "mergeCells": {
@@ -474,10 +529,36 @@ def _row_height(sid: int, r0: int, r1: int, px: int) -> dict:
             "fields": "pixelSize",
         }
     }
+def _borders_light(sid: int, r0: int, r1: int, c0: int, c1: int) -> dict:
+    b = {"style": "SOLID", "color": C_GRID}
+    return {
+        "updateBorders": {
+            "range": {
+                "sheetId": sid,
+                "startRowIndex": r0, "endRowIndex": r1,
+                "startColumnIndex": c0, "endColumnIndex": c1
+            },
+            "top": b, "bottom": b, "left": b, "right": b,
+            "innerHorizontal": b, "innerVertical": b,
+        }
+    }
 
+
+def _outline(sid: int, r0: int, r1: int, c0: int, c1: int) -> dict:
+    b = {"style": "SOLID_MEDIUM", "color": C_GRID}
+    return {
+        "updateBorders": {
+            "range": {
+                "sheetId": sid,
+                "startRowIndex": r0, "endRowIndex": r1,
+                "startColumnIndex": c0, "endColumnIndex": c1
+            },
+            "top": b, "bottom": b, "left": b, "right": b,
+        }
+    }
 
 def _borders(sid: int, r0: int, r1: int, c0: int, c1: int) -> dict:
-    b = {"style": "SOLID", "color": C_GREY_BORDER}
+    b = {"style": "SOLID", "color": C_GRID}
     return {
         "updateBorders": {
             "range": {"sheetId": sid,
@@ -487,7 +568,6 @@ def _borders(sid: int, r0: int, r1: int, c0: int, c1: int) -> dict:
             "innerHorizontal": b, "innerVertical": b,
         }
     }
-
 
 # ─── row_map кэш ──────────────────────────────────────────────────────────────
 
@@ -548,7 +628,13 @@ def mark_employee_fired(emp_id: int, fired_date: str, year: int, month: int) -> 
     try:
         sid = ws.id
         ws.spreadsheet.batch_update({"requests": [
-            _fmt(sid, row-1, row, 0, 6 + total_days + 2, bg=C_FIRED)
+            _fmt(sid, row-1, row, 0, 6 + total_days + 2,
+                 bg=C_FIRED, fg=C_DARK_TEXT, halign="CENTER", valign="MIDDLE"),
+            _fmt(sid, row-1, row, 0, 1,
+                 bg=C_FIRED, halign="LEFT", valign="MIDDLE"),
+            _fmt(sid, row-1, row, 2, 3,
+                 bg=C_FIRED, halign="LEFT", valign="MIDDLE"),
+            _outline(sid, row-1, row, 0, 6 + total_days + 2),
         ]})
     except Exception:
         pass
@@ -580,8 +666,13 @@ def add_replacement_row_to_sheet(main_emp_id: int, replacer_emp_id: int,
     try:
         sid = ws.id
         ws.spreadsheet.batch_update({"requests": [
-            _fmt(sid, new_row-1, new_row, 0, n_cols, bg=C_REPLACE),
-            _fmt(sid, new_row-1, new_row, 0, 3, bg=C_REPLACE, halign="LEFT"),
+            _fmt(sid, new_row-1, new_row, 0, n_cols,
+                 bg=C_REPLACE, fg=C_DARK_TEXT, halign="CENTER", valign="MIDDLE"),
+            _fmt(sid, new_row-1, new_row, 0, 1,
+                 bg=C_REPLACE, halign="LEFT", valign="MIDDLE"),
+            _fmt(sid, new_row-1, new_row, 2, 3,
+                 bg=C_REPLACE, halign="LEFT", valign="MIDDLE"),
+            _borders_light(sid, new_row-1, new_row, 0, n_cols),
         ]})
     except Exception:
         pass
