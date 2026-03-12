@@ -44,7 +44,7 @@ TZ = ZoneInfo(TIMEZONE)
     FIRE_DATE,
     # Добавление администратора
     NEW_ADMIN_ID,
-) = range(20)
+) = range(19)
 
 # Временное хранилище состояний разговора
 user_data_store: dict = {}
