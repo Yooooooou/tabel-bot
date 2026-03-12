@@ -95,34 +95,45 @@ def kb_skip_cancel() -> InlineKeyboardMarkup:
         InlineKeyboardButton("❌ Отмена",     callback_data="cancel"),
     ]])
 
+def kb_home() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("🏠 Главное меню", callback_data="nav:home"),
+    ]])
+
+def kb_home_repeat(repeat_label: str, repeat_data: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(repeat_label, callback_data=repeat_data)],
+        [InlineKeyboardButton("🏠 Главное меню", callback_data="nav:home")],
+    ])
+
 def kb_employees() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("➕ Добавить",     callback_data="emp:add")],
-        [InlineKeyboardButton("✏️ Редактировать", callback_data="emp:edit")],
-        [InlineKeyboardButton("🔥 Уволить",       callback_data="emp:fire")],
-        [InlineKeyboardButton("🗑 Удалить",        callback_data="emp:delete")],
-        [InlineKeyboardButton("📋 Список",         callback_data="emp:list")],
-        [InlineKeyboardButton("❌ Отмена",         callback_data="cancel")],
+        [InlineKeyboardButton("➕ Добавить сотрудника",  callback_data="emp:add")],
+        [InlineKeyboardButton("✏️ Редактировать",         callback_data="emp:edit")],
+        [InlineKeyboardButton("🔥 Уволить",               callback_data="emp:fire")],
+        [InlineKeyboardButton("🗑 Удалить из базы",        callback_data="emp:delete")],
+        [InlineKeyboardButton("📋 Список сотрудников",    callback_data="emp:list")],
+        [InlineKeyboardButton("🏠 Главное меню",          callback_data="nav:home")],
     ])
 
 def kb_shifts() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("✅ Отметить смену",    callback_data="shift:mark")],
-        [InlineKeyboardButton("✏️ Исправить смену",   callback_data="shift:edit")],
-        [InlineKeyboardButton("❌ Отмена",            callback_data="cancel")],
+        [InlineKeyboardButton("✅ Отметить смену",   callback_data="shift:mark")],
+        [InlineKeyboardButton("✏️ Исправить смену",  callback_data="shift:edit")],
+        [InlineKeyboardButton("🏠 Главное меню",     callback_data="nav:home")],
     ])
 
 def kb_finance() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("💵 Аванс",       callback_data="fin:advance")],
-        [InlineKeyboardButton("📉 Удержание",   callback_data="fin:deduction")],
-        [InlineKeyboardButton("❌ Отмена",       callback_data="cancel")],
+        [InlineKeyboardButton("💵 Аванс",         callback_data="fin:advance")],
+        [InlineKeyboardButton("📉 Удержание",     callback_data="fin:deduction")],
+        [InlineKeyboardButton("🏠 Главное меню",  callback_data="nav:home")],
     ])
 
 def kb_table() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🆕 Создать/пересобрать таблицу", callback_data="table:build")],
-        [InlineKeyboardButton("❌ Отмена",                       callback_data="cancel")],
+        [InlineKeyboardButton("🆕 Создать / пересобрать таблицу", callback_data="table:build")],
+        [InlineKeyboardButton("🏠 Главное меню",                   callback_data="nav:home")],
     ])
 
 def kb_sections() -> InlineKeyboardMarkup:
@@ -242,23 +253,38 @@ def kb_edit_fields() -> InlineKeyboardMarkup:
 
 # ─── /start ───────────────────────────────────────────────────────────────────
 
+def _main_menu_text() -> str:
+    t = today_tz()
+    return (f"🏠 <b>Главное меню</b>\n"
+            f"📅 {t.day} {MONTH_NAMES_RU[t.month]} {t.year}")
+
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_authorized(update.effective_chat.id):
         await update.message.reply_text("⛔ Нет доступа.")
         return
-    await update.message.reply_text("👋 Привет! Я Табель-бот. Выберите действие:",
-                                    reply_markup=kb_main())
+    await update.message.reply_text(_main_menu_text(),
+                                    parse_mode="HTML", reply_markup=kb_main())
 
 async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
-    await update.message.reply_text("Отменено.", reply_markup=kb_main())
+    await update.message.reply_text("❌ Отменено.\n" + _main_menu_text(),
+                                    parse_mode="HTML", reply_markup=kb_main())
     return ConversationHandler.END
 
 async def cb_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
     await update.callback_query.answer()
-    await update.callback_query.edit_message_text("Отменено.")
+    await update.callback_query.edit_message_text(
+        "❌ Отменено.\n" + _main_menu_text(),
+        parse_mode="HTML", reply_markup=kb_main()
+    )
     return ConversationHandler.END
+
+async def cb_nav_home(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Кнопка «🏠 Главное меню» из любого места."""
+    q = update.callback_query
+    await q.answer()
+    await q.edit_message_text(_main_menu_text(), parse_mode="HTML", reply_markup=kb_main())
 
 
 # ─── Главное меню (callback) ──────────────────────────────────────────────────
@@ -272,13 +298,26 @@ async def cb_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     action = q.data.split(":")[1]
 
     if action == "employees":
-        await q.edit_message_text("👥 Сотрудники:", reply_markup=kb_employees())
+        await q.edit_message_text(
+            "👥 <b>Сотрудники</b>\nДобавление, редактирование, увольнение:",
+            parse_mode="HTML", reply_markup=kb_employees()
+        )
     elif action == "shifts":
-        await q.edit_message_text("📅 Смены:", reply_markup=kb_shifts())
+        await q.edit_message_text(
+            "📅 <b>Смены</b>\nОтметьте или исправьте смены за любой день месяца:",
+            parse_mode="HTML", reply_markup=kb_shifts()
+        )
     elif action == "finance":
-        await q.edit_message_text("💰 Финансы:", reply_markup=kb_finance())
+        await q.edit_message_text(
+            "💰 <b>Финансы</b>\nАванс или удержание для сотрудника:",
+            parse_mode="HTML", reply_markup=kb_finance()
+        )
     elif action == "table":
-        await q.edit_message_text("📊 Таблица:", reply_markup=kb_table())
+        t = today_tz()
+        await q.edit_message_text(
+            f"📊 <b>Таблица</b>\nТекущий месяц: {month_label(t.year, t.month)}",
+            parse_mode="HTML", reply_markup=kb_table()
+        )
     elif action == "xlsx":
         await q.edit_message_text("⏳ Формирую .xlsx, подождите…")
         await _action_send_xlsx(update, context)
@@ -306,7 +345,8 @@ async def cb_emp_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
             status = " 🚫" if e.get("fired") else ""
             lines.append(f"  • {e['name']}{status} | {e.get('schedule','')} | {e.get('phone','')}")
     await q.edit_message_text("\n".join(lines) or "Список пуст.",
-                              parse_mode="HTML", reply_markup=kb_cancel())
+                              parse_mode="HTML",
+                              reply_markup=kb_home_repeat("👥 Сотрудники", "menu:employees"))
 
 
 # ════════════════════════════════════════════════════════════════════
@@ -317,31 +357,43 @@ async def conv_add_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
     context.user_data.clear()
-    await q.edit_message_text("Введите ФИО сотрудника:", reply_markup=kb_cancel())
+    await q.edit_message_text(
+        "👥 Сотрудники › ➕ Добавить\n\nШаг 1/5 — Введите ФИО сотрудника:",
+        reply_markup=kb_cancel()
+    )
     return ADD_NAME
 
 async def conv_add_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["name"] = update.message.text.strip()
-    await update.message.reply_text("Введите номер телефона (или пропустите):",
-                                    reply_markup=kb_skip_cancel())
+    await update.message.reply_text(
+        f"✅ ФИО: <b>{context.user_data['name']}</b>\n\nШаг 2/5 — Введите номер телефона (или пропустите):",
+        parse_mode="HTML", reply_markup=kb_skip_cancel()
+    )
     return ADD_PHONE
 
 async def conv_add_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["phone"] = update.message.text.strip()
-    await update.message.reply_text("Введите должность (напр. «Официант», «Кассир»):",
-                                    reply_markup=kb_cancel())
+    await update.message.reply_text(
+        "Шаг 3/5 — Введите должность (например: «Официант», «Кассир», «Администратор»):",
+        reply_markup=kb_cancel()
+    )
     return ADD_POSITION
 
 async def conv_add_phone_skip(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["phone"] = ""
     await update.callback_query.answer()
-    await update.callback_query.edit_message_text("Введите должность:",
-                                                  reply_markup=kb_cancel())
+    await update.callback_query.edit_message_text(
+        "Шаг 3/5 — Введите должность:",
+        reply_markup=kb_cancel()
+    )
     return ADD_POSITION
 
 async def conv_add_position(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["position"] = update.message.text.strip()
-    await update.message.reply_text("Выберите раздел:", reply_markup=kb_sections())
+    await update.message.reply_text(
+        "Шаг 4/5 — Выберите раздел табеля:",
+        reply_markup=kb_sections()
+    )
     return ADD_SECTION
 
 async def conv_add_section(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -349,7 +401,10 @@ async def conv_add_section(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await q.answer()
     section = q.data.split(":")[1]
     context.user_data["section"] = section
-    await q.edit_message_text("Выберите график:", reply_markup=kb_schedules(section))
+    await q.edit_message_text(
+        f"✅ Раздел: <b>{SECTION_LABELS[section]}</b>\n\nШаг 5/5 — Выберите график:",
+        parse_mode="HTML", reply_markup=kb_schedules(section)
+    )
     return ADD_SCHEDULE
 
 async def conv_add_schedule(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -418,12 +473,16 @@ async def _finish_add_employee(msg_or_query, context: ContextTypes.DEFAULT_TYPE)
         "days_off":   data.get("days_off", []),
         "start_date": data.get("start_date", ""),
     })
-    text = (f"✅ Сотрудник добавлен:\n"
-            f"<b>{emp['name']}</b> | {emp['position']} | {emp['schedule']}")
+    text = (f"✅ <b>Сотрудник добавлен!</b>\n\n"
+            f"👤 {emp['name']}\n"
+            f"💼 {emp.get('position','—')}\n"
+            f"📋 {emp.get('schedule','—')} | {SECTION_LABELS.get(emp['section'],'')}\n"
+            f"📞 {emp.get('phone','—')}")
+    kb = kb_home_repeat("➕ Добавить ещё", "emp:add")
     if hasattr(msg_or_query, "edit_message_text"):
-        await msg_or_query.edit_message_text(text, parse_mode="HTML")
+        await msg_or_query.edit_message_text(text, parse_mode="HTML", reply_markup=kb)
     else:
-        await msg_or_query.reply_text(text, parse_mode="HTML")
+        await msg_or_query.reply_text(text, parse_mode="HTML", reply_markup=kb)
     context.user_data.clear()
     return ConversationHandler.END
 
@@ -445,7 +504,8 @@ def conv_add_employee() -> ConversationHandler:
         },
         fallbacks=[
             CommandHandler("cancel", cmd_cancel),
-            CallbackQueryHandler(cb_cancel, pattern="^cancel$"),
+            CallbackQueryHandler(cb_cancel,   pattern="^cancel$"),
+            CallbackQueryHandler(cb_nav_home, pattern="^nav:home$"),
         ],
         per_message=False,
     )
@@ -526,7 +586,12 @@ async def conv_edit_value_text(update: Update, context: ContextTypes.DEFAULT_TYP
             return EDIT_VALUE
 
     db.update_employee(emp_id, {field: raw})
-    await update.message.reply_text(f"✅ Поле «{field}» обновлено.")
+    emp = db.get_employee(emp_id)
+    await update.message.reply_text(
+        f"✅ Обновлено! <b>{emp['name']}</b>",
+        parse_mode="HTML",
+        reply_markup=kb_home_repeat("✏️ Редактировать ещё", "emp:edit")
+    )
     context.user_data.clear()
     return ConversationHandler.END
 
@@ -540,7 +605,10 @@ async def conv_edit_value_cb(update: Update, context: ContextTypes.DEFAULT_TYPE)
         val = q.data.split(":")[1]
         if val == "done":
             db.update_employee(emp_id, {"days_off": context.user_data["days_off"]})
-            await q.edit_message_text("✅ Выходные обновлены.")
+            await q.edit_message_text(
+                "✅ Выходные обновлены.",
+                reply_markup=kb_home_repeat("✏️ Редактировать ещё", "emp:edit")
+            )
             context.user_data.clear()
             return ConversationHandler.END
         idx = int(val)
@@ -556,7 +624,11 @@ async def conv_edit_value_cb(update: Update, context: ContextTypes.DEFAULT_TYPE)
     elif field == "schedule":
         schedule = q.data.split(":")[1]
         db.update_employee(emp_id, {"schedule": schedule})
-        await q.edit_message_text(f"✅ График обновлён: {schedule}")
+        await q.edit_message_text(
+            f"✅ График обновлён: <b>{schedule}</b>",
+            parse_mode="HTML",
+            reply_markup=kb_home_repeat("✏️ Редактировать ещё", "emp:edit")
+        )
         context.user_data.clear()
         return ConversationHandler.END
 
@@ -576,7 +648,8 @@ def conv_edit_employee() -> ConversationHandler:
         },
         fallbacks=[
             CommandHandler("cancel", cmd_cancel),
-            CallbackQueryHandler(cb_cancel, pattern="^cancel$"),
+            CallbackQueryHandler(cb_cancel,   pattern="^cancel$"),
+            CallbackQueryHandler(cb_nav_home, pattern="^nav:home$"),
         ],
         per_message=False,
     )
@@ -740,13 +813,14 @@ async def _finish_shift(msg_or_query, context: ContextTypes.DEFAULT_TYPE,
         result_text = f"✅ Записано: {emp['name']} | день {day} = {value}"
 
     if not ok:
-        result_text = ("⚠️ Строка сотрудника не найдена в таблице. "
+        result_text = ("⚠️ Строка сотрудника не найдена в таблице.\n"
                        "Сначала создайте таблицу через меню 📊.")
 
+    kb = kb_home_repeat("📅 Отметить ещё", "shift:mark")
     if hasattr(msg_or_query, "edit_message_text"):
-        await msg_or_query.edit_message_text(result_text)
+        await msg_or_query.edit_message_text(result_text, reply_markup=kb)
     else:
-        await msg_or_query.reply_text(result_text)
+        await msg_or_query.reply_text(result_text, reply_markup=kb)
 
     context.user_data.clear()
     return ConversationHandler.END
@@ -777,7 +851,8 @@ def conv_shifts() -> ConversationHandler:
         },
         fallbacks=[
             CommandHandler("cancel", cmd_cancel),
-            CallbackQueryHandler(cb_cancel, pattern="^cancel$"),
+            CallbackQueryHandler(cb_cancel,   pattern="^cancel$"),
+            CallbackQueryHandler(cb_nav_home, pattern="^nav:home$"),
         ],
         per_message=False,
     )
@@ -835,14 +910,16 @@ async def conv_fin_value(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     ok = sheets.write_finance(emp_id, fin_type, amount, t.year, t.month)
     label = "Аванс" if fin_type == "advance" else "Удержание"
+    kb = kb_home_repeat("💰 Ещё финансы", "menu:finance")
     if ok:
         await update.message.reply_text(
-            f"✅ {label} для <b>{emp['name']}</b> = {amount} ₸",
-            parse_mode="HTML"
+            f"✅ <b>{label}</b> для {emp['name']} = {amount:,} ₸".replace(",", " "),
+            parse_mode="HTML", reply_markup=kb
         )
     else:
         await update.message.reply_text(
-            "⚠️ Строка не найдена. Сначала создайте таблицу."
+            "⚠️ Строка не найдена. Сначала создайте таблицу 📊.",
+            reply_markup=kb_home()
         )
     context.user_data.clear()
     return ConversationHandler.END
@@ -859,7 +936,8 @@ def conv_finance() -> ConversationHandler:
         },
         fallbacks=[
             CommandHandler("cancel", cmd_cancel),
-            CallbackQueryHandler(cb_cancel, pattern="^cancel$"),
+            CallbackQueryHandler(cb_cancel,   pattern="^cancel$"),
+            CallbackQueryHandler(cb_nav_home, pattern="^nav:home$"),
         ],
         per_message=False,
     )
@@ -912,8 +990,8 @@ async def conv_fire_date(update: Update, context: ContextTypes.DEFAULT_TYPE):
     sheets.mark_employee_fired(emp_id, raw, t.year, t.month)
 
     await update.message.reply_text(
-        f"🚫 <b>{emp['name']}</b> уволен с {raw}. Строка помечена в таблице.",
-        parse_mode="HTML"
+        f"🚫 <b>{emp['name']}</b> уволен с {raw}.\nСтрока помечена в таблице розовым.",
+        parse_mode="HTML", reply_markup=kb_home()
     )
     context.user_data.clear()
     return ConversationHandler.END
@@ -928,7 +1006,8 @@ def conv_fire_employee() -> ConversationHandler:
         },
         fallbacks=[
             CommandHandler("cancel", cmd_cancel),
-            CallbackQueryHandler(cb_cancel, pattern="^cancel$"),
+            CallbackQueryHandler(cb_cancel,   pattern="^cancel$"),
+            CallbackQueryHandler(cb_nav_home, pattern="^nav:home$"),
         ],
         per_message=False,
     )
@@ -958,8 +1037,11 @@ async def conv_delete_emp(update: Update, context: ContextTypes.DEFAULT_TYPE):
     emp = db.get_employee(emp_id)
     name = emp["name"] if emp else str(emp_id)
     db.delete_employee(emp_id)
-    await q.edit_message_text(f"🗑 Сотрудник <b>{name}</b> удалён из базы.",
-                               parse_mode="HTML")
+    await q.edit_message_text(
+        f"🗑 Сотрудник <b>{name}</b> удалён из базы.",
+        parse_mode="HTML",
+        reply_markup=kb_home_repeat("👥 Сотрудники", "menu:employees")
+    )
     return ConversationHandler.END
 
 
@@ -971,7 +1053,8 @@ def conv_delete_employee() -> ConversationHandler:
         },
         fallbacks=[
             CommandHandler("cancel", cmd_cancel),
-            CallbackQueryHandler(cb_cancel, pattern="^cancel$"),
+            CallbackQueryHandler(cb_cancel,   pattern="^cancel$"),
+            CallbackQueryHandler(cb_nav_home, pattern="^nav:home$"),
         ],
         per_message=False,
     )
@@ -998,7 +1081,11 @@ async def conv_newadmin_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Введите числовой chat_id:", reply_markup=kb_cancel())
         return NEW_ADMIN_ID
     db.add_bot_admin(new_id)
-    await update.message.reply_text(f"✅ Администратор {new_id} добавлен.")
+    await update.message.reply_text(
+        f"✅ Администратор <code>{new_id}</code> добавлен.",
+        parse_mode="HTML",
+        reply_markup=kb_home()
+    )
     return ConversationHandler.END
 
 
@@ -1010,7 +1097,8 @@ def conv_new_admin() -> ConversationHandler:
         },
         fallbacks=[
             CommandHandler("cancel", cmd_cancel),
-            CallbackQueryHandler(cb_cancel, pattern="^cancel$"),
+            CallbackQueryHandler(cb_cancel,   pattern="^cancel$"),
+            CallbackQueryHandler(cb_nav_home, pattern="^nav:home$"),
         ],
         per_message=False,
     )
@@ -1033,13 +1121,15 @@ async def cb_table_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             ws, _ = sheets.build_sheet(t.year, t.month)
             await q.edit_message_text(
-                f"✅ Таблица <b>{month_label(t.year, t.month)}</b> готова!\n"
-                f"Лист: «{ws.title}»",
-                parse_mode="HTML"
+                f"✅ <b>Таблица готова!</b>\n\n"
+                f"📋 Лист: «{ws.title}»\n"
+                f"📅 {month_label(t.year, t.month)}",
+                parse_mode="HTML",
+                reply_markup=kb_home_repeat("📁 Скачать .xlsx", "menu:xlsx")
             )
         except Exception as e:
             logger.exception("build_sheet error")
-            await q.edit_message_text(f"❌ Ошибка: {e}")
+            await q.edit_message_text(f"❌ Ошибка: {e}", reply_markup=kb_home())
 
 
 # ─── Скачать xlsx ─────────────────────────────────────────────────────────────
@@ -1058,11 +1148,20 @@ async def _action_send_xlsx(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     caption=f"📁 Табель {month_label(t.year, t.month)}"
                 )
             os.remove(path)
+            await context.bot.send_message(
+                chat_id=q.message.chat_id,
+                text=_main_menu_text(),
+                parse_mode="HTML",
+                reply_markup=kb_main()
+            )
         else:
-            await q.edit_message_text("❌ Лист не найден. Сначала создайте таблицу.")
+            await q.edit_message_text(
+                "❌ Лист не найден. Сначала создайте таблицу 📊.",
+                reply_markup=kb_home_repeat("📊 Создать таблицу", "menu:table")
+            )
     except Exception as e:
         logger.exception("export_to_xlsx error")
-        await q.edit_message_text(f"❌ Ошибка экспорта: {e}")
+        await q.edit_message_text(f"❌ Ошибка экспорта: {e}", reply_markup=kb_home())
 
 
 # ─── Настройки ────────────────────────────────────────────────────────────────
@@ -1070,12 +1169,13 @@ async def _action_send_xlsx(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def _action_settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     admins = db.get_bot_admins()
-    text = f"⚙️ Настройки\n\nТекущие администраторы: {admins or '(только владелец)'}"
+    admins_text = "\n".join(f"  • {a}" for a in admins) if admins else "  (только владелец)"
+    text = f"⚙️ <b>Настройки</b>\n\nАдминистраторы бота:\n{admins_text}"
     kb = InlineKeyboardMarkup([
         [InlineKeyboardButton("➕ Добавить администратора", callback_data="settings:add_admin")],
-        [InlineKeyboardButton("❌ Закрыть", callback_data="cancel")],
+        [InlineKeyboardButton("🏠 Главное меню",            callback_data="nav:home")],
     ])
-    await q.edit_message_text(text, reply_markup=kb)
+    await q.edit_message_text(text, parse_mode="HTML", reply_markup=kb)
 
 
 # ════════════════════════════════════════════════════════════════════
@@ -1123,12 +1223,13 @@ def setup_handlers(app: Application):
     app.add_handler(conv_new_admin())
 
     # Команды
-    app.add_handler(CommandHandler("start", cmd_start))
-    app.add_handler(CommandHandler("menu",  cmd_start))
+    app.add_handler(CommandHandler("start",  cmd_start))
+    app.add_handler(CommandHandler("menu",   cmd_start))
     app.add_handler(CommandHandler("cancel", cmd_cancel))
 
-    # Навигация по главному меню
-    app.add_handler(CallbackQueryHandler(cb_main_menu, pattern="^menu:"))
+    # Навигация
+    app.add_handler(CallbackQueryHandler(cb_nav_home,   pattern="^nav:home$"))
+    app.add_handler(CallbackQueryHandler(cb_main_menu,  pattern="^menu:"))
 
     # Список сотрудников
     app.add_handler(CallbackQueryHandler(cb_emp_list, pattern="^emp:list$"))
