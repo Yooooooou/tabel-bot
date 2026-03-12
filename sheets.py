@@ -53,16 +53,18 @@ def _get_spreadsheet():
     gc = gspread.authorize(creds)
     return gc.open_by_key(SPREADSHEET_ID)
 
-
 def get_or_create_sheet(year: int, month: int):
     sheet_name = f"{MONTH_NAMES_RU[month]} {year}"
     sp = _get_spreadsheet()
-    try:
-        return sp.worksheet(sheet_name)
-    except gspread.WorksheetNotFound:
-        ws = sp.add_worksheet(title=sheet_name, rows=300, cols=45)
-        return ws
 
+    try:
+        old_ws = sp.worksheet(sheet_name)
+        sp.del_worksheet(old_ws)
+    except gspread.WorksheetNotFound:
+        pass
+
+    ws = sp.add_worksheet(title=sheet_name, rows=300, cols=45)
+    return ws
 
 # ─── Колонки ──────────────────────────────────────────────────────────────────
 # 1=A  ФИО
@@ -100,7 +102,6 @@ def build_sheet(year: int, month: int):
     Возвращает (worksheet, row_map).
     """
     ws = get_or_create_sheet(year, month)
-    ws.clear()
 
     employees   = get_all_employees()
     total_days  = days_in_month(year, month)
