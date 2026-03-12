@@ -39,7 +39,7 @@ C_GREY_BORDER = {"red": 0.700, "green": 0.700, "blue": 0.700}
 
 def _get_spreadsheet():
     scopes = [
-        "https://spreadsheets.google.com/feeds",
+        "https://www.googleapis.com/auth/spreadsheets",
         "https://www.googleapis.com/auth/drive",
     ]
     if os.path.exists(GOOGLE_CREDS_JSON):
@@ -116,7 +116,7 @@ def build_sheet(year: int, month: int):
 
     # ── Заголовок листа (строка 1) ──
     title_row = [""] * n_cols
-    title_row[int(n_cols / 2)] = f"{MONTH_NAMES_RU[month]} {year}"
+    title_row[0] = f"{MONTH_NAMES_RU[month]} {year}"
     all_data.append(title_row)
     all_data.append([""] * n_cols)   # пустая строка-отступ
     current_row += 2
@@ -145,7 +145,7 @@ def build_sheet(year: int, month: int):
         header_text = SECTION_SHEET_HEADER[section]
         if header_text:
             h_row = [""] * n_cols
-            h_row[int(n_cols / 2)] = header_text
+            h_row[0] = header_text
             all_data.append(h_row)
             sec_info["section_header_row"] = current_row
             current_row += 1
@@ -215,8 +215,10 @@ def build_sheet(year: int, month: int):
     try:
         _format_sheet(ws, layout, total_days, year, month)
     except Exception as e:
-        import logging
-        logging.getLogger(__name__).warning(f"Formatting failed (non-critical): {e}")
+        import logging, traceback
+        logging.getLogger(__name__).error(
+            f"Formatting failed: {e}\n{traceback.format_exc()}"
+        )
 
     _save_row_map(year, month, row_map)
     return ws, row_map
@@ -262,6 +264,9 @@ def _build_replacement_row(rep: dict, main_emp: dict, row: int, total_days: int)
 def _build_total_row(section: str, start_row: int, end_row: int,
                      total_days: int, n_cols: int) -> list:
     total_row = [""] * n_cols
+    if start_row > end_row:
+        # Empty section — no employees, skip formulas to avoid #REF!
+        return total_row
     if section == "runners":
         total_row[5] = f"=SUM(F{start_row}:F{end_row})"
     else:
@@ -444,7 +449,7 @@ def _fmt(sid: int, r0: int, r1: int, c0: int, c1: int,
                       "startRowIndex": r0, "endRowIndex": r1,
                       "startColumnIndex": c0, "endColumnIndex": c1},
             "cell": {"userEnteredFormat": fmt},
-            "fields": "userEnteredFormat(" + ",".join(fields) + ")",
+            "fields": "userEnteredFormat",
         }
     }
 
@@ -472,7 +477,7 @@ def _row_height(sid: int, r0: int, r1: int, px: int) -> dict:
 
 
 def _borders(sid: int, r0: int, r1: int, c0: int, c1: int) -> dict:
-    b = {"style": "SOLID", "width": 1, "color": C_GREY_BORDER}
+    b = {"style": "SOLID", "color": C_GREY_BORDER}
     return {
         "updateBorders": {
             "range": {"sheetId": sid,
