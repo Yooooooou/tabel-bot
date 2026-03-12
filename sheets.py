@@ -75,6 +75,84 @@ def recreate_sheet(year: int, month: int):
 
     ws = sp.add_worksheet(title=sheet_name, rows=300, cols=45)
     return ws
+def get_sheet_if_exists(year: int, month: int):
+    sheet_name = f"{MONTH_NAMES_RU[month]} {year}"
+    sp = _get_spreadsheet()
+    try:
+        return sp.worksheet(sheet_name)
+    except gspread.WorksheetNotFound:
+        return None
+
+
+def _load_existing_sheet_state(year: int, month: int, total_days: int) -> dict:
+    """
+    Считывает уже проставленные смены/удержание/аванс из текущего листа
+    перед его пересозданием.
+    Возвращает:
+    {
+        "emp_id": {
+            "days": [...],
+            "deduction": "...",
+            "advance": "..."
+        }
+    }
+    """
+    ws = get_sheet_if_exists(year, month)
+    if ws is None:
+        return {}
+
+    row_map = _load_row_map(year, month)
+    if not row_map:
+        return {}
+
+    values = ws.get_all_values()
+    state = {}
+
+    for emp_id, row in row_map.items():
+        try:
+            row = int(row)
+            if row - 1 >= len(values):
+                continue
+
+            row_vals = values[row - 1]
+
+            # добиваем строку до нужной длины
+            need_len = 6 + total_days + 2
+            if len(row_vals) < need_len:
+                row_vals += [""] * (need_len - len(row_vals))
+
+            day_values = row_vals[6:6 + total_days]
+            deduction = row_vals[6 + total_days]
+            advance = row_vals[6 + total_days + 1]
+
+            normalized_days = []
+            for v in day_values:
+                if v == "":
+                    normalized_days.append(0)
+                else:
+                    normalized_days.append(v)
+
+            state[str(emp_id)] = {
+                "days": normalized_days,
+                "deduction": deduction,
+                "advance": advance,
+            }
+        except Exception:
+            continue
+
+    return state
+def _schedule_as_text(value) -> str:
+    """
+    Чтобы Google Sheets не превращал 2/2 или 5/2 в дату/формулу.
+    Апостроф в таблице не отображается, но заставляет хранить значение как текст.
+    """
+    if value is None:
+        return ""
+    value = str(value).strip()
+    if not value:
+        return ""
+    return f"'{value}"
+
 # ─── Колонки ──────────────────────────────────────────────────────────────────
 # 1=A  ФИО
 # 2=B  Номер
@@ -110,10 +188,11 @@ def build_sheet(year: int, month: int):
     Полностью пересобрать лист табеля с форматированием.
     Возвращает (worksheet, row_map).
     """
-    ws = recreate_sheet(year, month)
-
     employees   = get_all_employees()
     total_days  = days_in_month(year, month)
+    existing_state = _load_existing_sheet_state(year, month, total_days)
+
+    ws = recreate_sheet(year, month)
     n_cols      = 6 + total_days + 2
 
     all_data    = []
@@ -192,7 +271,9 @@ def build_sheet(year: int, month: int):
         sec_info["data_start"] = current_row
 
         for emp in sec_emps:
-            emp_row = _build_emp_row(emp, section, current_row, year, month, total_days)
+            emp_row = _build_emp_row(
+    emp, section, current_row, year, month, total_days, existing_state
+)
             all_data.append(emp_row)
             row_map[emp["id"]] = current_row
             current_row += 1
@@ -203,7 +284,7 @@ def build_sheet(year: int, month: int):
                 if e.get("is_replacement_for") == emp["id"]
             ]
             for rep in replacements:
-                rep_row = _build_replacement_row(rep, emp, current_row, total_days)
+                rep_row = _build_replacement_row(rep, emp, current_row, total_days, existing_state)
                 all_data.append(rep_row)
                 row_map[rep["id"]] = current_row
                 sec_info["replacement_rows"].append(current_row)
@@ -237,37 +318,68 @@ def build_sheet(year: int, month: int):
 # ─── Построители строк ────────────────────────────────────────────────────────
 
 def _build_emp_row(emp: dict, section: str, row: int,
-                   year: int, month: int, total_days: int) -> list:
+                   year: int, month: int, total_days: int,
+                   existing_state: dict = None) -> list:
     plan = None if section == "runners" else calc_plan_shifts(emp, year, month)
     fired_str = f"Уволен с {emp.get('fired_date', '')}" if emp.get("fired") else ""
 
+    existing_state = existing_state or {}
+    saved = existing_state.get(str(emp["id"]), {})
+    saved_days = saved.get("days", [0] * total_days)
+    saved_deduction = saved.get("deduction", "")
+    saved_advance = saved.get("advance", "")
+
+    if len(saved_days) < total_days:
+        saved_days = saved_days + [0] * (total_days - len(saved_days))
+    else:
+        saved_days = saved_days[:total_days]
+
     if section == "runners":
-        base = [emp["name"], emp.get("phone", ""), emp.get("position", "Раннер"),
-                "", "", f"=SUM({day_col(1)}{row}:{day_col(total_days)}{row})"]
+        base = [
+            emp["name"],
+            emp.get("phone", ""),
+            emp.get("position", "Раннер"),
+            "",
+            "",
+            f"=SUM({day_col(1)}{row}:{day_col(total_days)}{row})"
+        ]
     else:
         base = [
             emp["name"],
             emp.get("phone", ""),
             emp.get("position", ""),
-            emp.get("schedule", ""),
+            _schedule_as_text(emp.get("schedule", "")),
             plan if plan is not None else "",
             f"=SUM({day_col(1)}{row}:{day_col(total_days)}{row})",
         ]
-    base += [0] * total_days
-    base += [fired_str or "", ""]
+
+    base += saved_days
+    base += [fired_str or saved_deduction or "", saved_advance]
     return base
 
+def _build_replacement_row(rep: dict, main_emp: dict, row: int, total_days: int,
+                           existing_state: dict = None) -> list:
+    existing_state = existing_state or {}
+    saved = existing_state.get(str(rep["id"]), {})
+    saved_days = saved.get("days", [0] * total_days)
+    saved_deduction = saved.get("deduction", "")
+    saved_advance = saved.get("advance", "")
 
-def _build_replacement_row(rep: dict, main_emp: dict, row: int, total_days: int) -> list:
+    if len(saved_days) < total_days:
+        saved_days = saved_days + [0] * (total_days - len(saved_days))
+    else:
+        saved_days = saved_days[:total_days]
+
     base = [
         f"{rep['name']} (замена за {main_emp['name']})",
         rep.get("phone", ""),
         rep.get("position", main_emp.get("position", "")),
-        "", "",
+        "",
+        "",
         f"=SUM({day_col(1)}{row}:{day_col(total_days)}{row})",
     ]
-    base += [0] * total_days
-    base += ["", ""]
+    base += saved_days
+    base += [saved_deduction, saved_advance]
     return base
 
 
@@ -447,7 +559,24 @@ def _format_sheet(ws, layout: dict, total_days: int, year: int, month: int):
                 "fields": "pixelSize",
             }
         })
-
+    # Колонка "График" как текст
+    reqs.append({
+        "repeatCell": {
+            "range": {
+                "sheetId": sid,
+                "startColumnIndex": 3,
+                "endColumnIndex": 4
+            },
+            "cell": {
+                "userEnteredFormat": {
+                    "numberFormat": {
+                        "type": "TEXT"
+                    }
+                }
+            },
+            "fields": "userEnteredFormat.numberFormat"
+        }
+    })
     # Заморозка
     reqs.append({
         "updateSheetProperties": {
