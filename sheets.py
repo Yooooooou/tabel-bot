@@ -65,7 +65,6 @@ def get_or_create_sheet(year: int, month: int):
 
     ws = sp.add_worksheet(title=sheet_name, rows=300, cols=45)
     return ws
-
 # ─── Колонки ──────────────────────────────────────────────────────────────────
 # 1=A  ФИО
 # 2=B  Номер
@@ -466,7 +465,8 @@ def _format_sheet(ws, layout: dict, total_days: int, year: int, month: int):
             "fields": "gridProperties.frozenColumnCount,gridProperties.frozenRowCount",
         }
     })
-
+    print("FORMAT REQUESTS:", len(reqs))
+    reqs.append(_fmt(sid, 0, 3, 0, 5, bg={"red": 1, "green": 0.8, "blue": 0.8}, bold=True))
     ws.spreadsheet.batch_update({"requests": reqs})
 
 # ─── Хелперы для Sheets API requests ─────────────────────────────────────────
