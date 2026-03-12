@@ -616,6 +616,104 @@ async def _finalize_emp_add(query_or_msg, chat_id: int):
     return ConversationHandler.END
 
 
+# ─── Редактирование сотрудника ────────────────────────────────────────────────
+
+async def emp_edit_pick(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    employees = [e for e in db.get_all_employees() if not e.get("fired") and not e.get("is_replacement_for")]
+    if not employees:
+        await query.edit_message_text(
+            "Нет сотрудников для редактирования.",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("◀️ Назад", callback_data="menu_employees")
+            ]])
+        )
+        return
+
+    keyboard = []
+    for emp in employees:
+        short = " ".join(emp["name"].split()[:2])
+        sec = SECTION_LABELS.get(emp["section"], "")
+        keyboard.append([InlineKeyboardButton(
+            f"{short} ({sec})", callback_data=f"emp_edit_{emp['id']}"
+        )])
+    keyboard.append([InlineKeyboardButton("◀️ Назад", callback_data="menu_employees")])
+
+    await query.edit_message_text(
+        "✏️ Выберите сотрудника для редактирования:",
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+
+
+async def emp_edit_select(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    chat_id = query.message.chat_id
+
+    emp_id = int(query.data.replace("emp_edit_", ""))
+    emp = db.get_employee(emp_id)
+    user_data_store[chat_id] = {"editing_emp": emp_id}
+
+    keyboard = [
+        [InlineKeyboardButton("Имя",       callback_data=f"emp_editf_{emp_id}_name")],
+        [InlineKeyboardButton("Телефон",   callback_data=f"emp_editf_{emp_id}_phone")],
+        [InlineKeyboardButton("Должность", callback_data=f"emp_editf_{emp_id}_position")],
+        [InlineKeyboardButton("◀️ Назад",   callback_data="emp_edit_pick")],
+    ]
+    await query.edit_message_text(
+        f"✏️ *{emp['name']}*\nЧто редактируем?",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+
+
+async def emp_edit_field(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    chat_id = query.message.chat_id
+
+    _, _, emp_id_str, field = query.data.split("_", 3)
+    emp_id = int(emp_id_str)
+    user_data_store[chat_id] = {"editing_emp": emp_id, "editing_field": field}
+
+    field_labels = {"name": "ФИО", "phone": "телефон", "position": "должность"}
+    await query.edit_message_text(
+        f"✏️ Введите новое значение для *{field_labels.get(field, field)}*:",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("❌ Отмена", callback_data="menu_employees")
+        ]])
+    )
+    return EDIT_VALUE
+
+
+async def emp_edit_value(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    state = user_data_store.get(chat_id, {})
+    emp_id = state.get("editing_emp")
+    field = state.get("editing_field")
+
+    if not emp_id or not field:
+        return ConversationHandler.END
+
+    value = update.message.text.strip()
+    db.update_employee(emp_id, {field: value})
+    emp = db.get_employee(emp_id)
+
+    await update.message.reply_text(
+        f"✅ *{emp['name']}* обновлён.\n\n"
+        "Не забудьте пересобрать таблицу через 📊 Таблица → Пересобрать.",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("👥 К сотрудникам", callback_data="menu_employees")
+        ]])
+    )
+    user_data_store.pop(chat_id, None)
+    return ConversationHandler.END
+
+
 # ─── Увольнение ───────────────────────────────────────────────────────────────
 
 async def emp_fire_pick(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1032,6 +1130,16 @@ async def back_main_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
     await back_to_main(query)
 
 
+async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    user_data_store.pop(chat_id, None)
+    await update.message.reply_text(
+        "❌ Отменено. Главное меню:",
+        reply_markup=main_menu_keyboard()
+    )
+    return ConversationHandler.END
+
+
 def main():
     app = Application.builder().token(BOT_TOKEN).build()
 
@@ -1071,6 +1179,16 @@ def main():
         per_message=False,
     )
 
+    # ConversationHandler: редактирование сотрудника
+    edit_emp_conv = ConversationHandler(
+        entry_points=[CallbackQueryHandler(emp_edit_field, pattern="^emp_editf_")],
+        states={
+            EDIT_VALUE: [MessageHandler(filters.TEXT & ~filters.COMMAND, emp_edit_value)],
+        },
+        fallbacks=[CallbackQueryHandler(menu_employees, pattern="^menu_employees$")],
+        per_message=False,
+    )
+
     # ConversationHandler: добавление администратора
     admin_conv = ConversationHandler(
         entry_points=[CallbackQueryHandler(settings_add_admin, pattern="^settings_add_admin$")],
@@ -1082,9 +1200,11 @@ def main():
     )
 
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("cancel", cancel))
     app.add_handler(add_emp_conv)
     app.add_handler(fire_conv)
     app.add_handler(fin_conv)
+    app.add_handler(edit_emp_conv)
     app.add_handler(admin_conv)
 
     # Callback handlers
@@ -1092,6 +1212,8 @@ def main():
     app.add_handler(CallbackQueryHandler(menu_shift,                pattern="^menu_shift$"))
     app.add_handler(CallbackQueryHandler(menu_employees,            pattern="^menu_employees$"))
     app.add_handler(CallbackQueryHandler(emp_list,                  pattern="^emp_list$"))
+    app.add_handler(CallbackQueryHandler(emp_edit_pick,             pattern="^emp_edit_pick$"))
+    app.add_handler(CallbackQueryHandler(emp_edit_select,           pattern="^emp_edit_\\d+$"))
     app.add_handler(CallbackQueryHandler(emp_fire_pick,             pattern="^emp_fire_pick$"))
     app.add_handler(CallbackQueryHandler(menu_finance,              pattern="^menu_finance$"))
     app.add_handler(CallbackQueryHandler(fin_emp_select,            pattern="^fin_emp_\\d+$"))

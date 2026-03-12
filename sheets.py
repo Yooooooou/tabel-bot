@@ -10,6 +10,7 @@ from typing import Optional
 
 import gspread
 from google.oauth2.service_account import Credentials
+import google.auth.transport.requests
 
 from config import (SPREADSHEET_ID, GOOGLE_CREDS_JSON, MONTH_NAMES_RU,
                     WEEKDAYS_RU, SECTION_LABELS, SECTIONS)
@@ -200,7 +201,7 @@ def build_sheet(year: int, month: int):
         current_row += 1
 
     # Записываем всё одним запросом
-    ws.update("A1", all_data)
+    ws.update("A1", all_data, value_input_option="USER_ENTERED")
 
     # Сохраняем маппинг строк в настройки
     _save_row_map(year, month, row_map)
@@ -250,7 +251,7 @@ def write_shift(emp_id: int, day: int, value, year: int, month: int):
         return False
     ws = get_or_create_sheet(year, month)
     cell = f"{day_col(day)}{row}"
-    ws.update(cell, [[value]])
+    ws.update(cell, [[value]], value_input_option="USER_ENTERED")
     return True
 
 
@@ -269,7 +270,7 @@ def write_finance(emp_id: int, field: str, value, year: int, month: int):
         col = col_letter(6 + total_days + 1)
     else:
         col = col_letter(6 + total_days + 2)
-    ws.update(f"{col}{row}", [[value]])
+    ws.update(f"{col}{row}", [[value]], value_input_option="USER_ENTERED")
     return True
 
 
@@ -315,7 +316,7 @@ def mark_employee_fired(emp_id: int, fired_date: str, year: int, month: int):
     ws = get_or_create_sheet(year, month)
     total_days = days_in_month(year, month)
     col = col_letter(6 + total_days + 1)
-    ws.update(f"{col}{row}", [[f"Уволен с {fired_date}"]])
+    ws.update(f"{col}{row}", [[f"Уволен с {fired_date}"]], value_input_option="USER_ENTERED")
     return True
 
 
