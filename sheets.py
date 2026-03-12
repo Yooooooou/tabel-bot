@@ -56,6 +56,16 @@ def _get_spreadsheet():
 def get_or_create_sheet(year: int, month: int):
     sheet_name = f"{MONTH_NAMES_RU[month]} {year}"
     sp = _get_spreadsheet()
+    try:
+        return sp.worksheet(sheet_name)
+    except gspread.WorksheetNotFound:
+        ws = sp.add_worksheet(title=sheet_name, rows=300, cols=45)
+        return ws
+    
+    
+def recreate_sheet(year: int, month: int):
+    sheet_name = f"{MONTH_NAMES_RU[month]} {year}"
+    sp = _get_spreadsheet()
 
     try:
         old_ws = sp.worksheet(sheet_name)
@@ -100,7 +110,7 @@ def build_sheet(year: int, month: int):
     Полностью пересобрать лист табеля с форматированием.
     Возвращает (worksheet, row_map).
     """
-    ws = get_or_create_sheet(year, month)
+    ws = recreate_sheet(year, month)
 
     employees   = get_all_employees()
     total_days  = days_in_month(year, month)
