@@ -1,1265 +1,1210 @@
 """
-Табель-бот v2 — полная версия.
-Запуск: python bot.py
+Табель-бот — FastAPI + python-telegram-bot v20 (webhook mode)
+APScheduler — напоминания и авто-создание листа.
 """
 import logging
 import os
-from datetime import date, datetime, timedelta
+from contextlib import asynccontextmanager
+from datetime import date, datetime
 from zoneinfo import ZoneInfo
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, Document
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from fastapi import FastAPI, Request
+from telegram import (
+    Update, InlineKeyboardButton, InlineKeyboardMarkup,
+)
 from telegram.ext import (
     Application, CommandHandler, CallbackQueryHandler,
-    MessageHandler, ContextTypes, ConversationHandler, filters
+    MessageHandler, ConversationHandler, ContextTypes, filters,
 )
 
 import config
-from config import (BOT_TOKEN, ADMIN_CHAT_ID, MONTH_NAMES_RU, SECTIONS,
-                    SECTION_LABELS, TIMEZONE)
+from config import (
+    BOT_TOKEN, ADMIN_CHAT_ID, SECTIONS, SECTION_LABELS,
+    TIMEZONE, MONTH_NAMES_RU, WEBHOOK_URL,
+)
 import database as db
 import sheets
-from schedule import calc_plan_shifts, days_in_month
+from schedule import days_in_month
 
 logging.basicConfig(
     format="%(asctime)s %(name)s %(levelname)s %(message)s",
-    level=logging.INFO
+    level=logging.INFO,
 )
 logger = logging.getLogger(__name__)
 
 TZ = ZoneInfo(TIMEZONE)
 
-# ─── ConversationHandler states ──────────────────────────────────────────────
+
+# ─── Утилиты ──────────────────────────────────────────────────────────────────
+
+def now_tz() -> datetime:
+    return datetime.now(tz=TZ)
+
+def today_tz() -> date:
+    return now_tz().date()
+
+def is_authorized(chat_id: int) -> bool:
+    return chat_id == ADMIN_CHAT_ID or chat_id in db.get_bot_admins()
+
+def month_label(year: int, month: int) -> str:
+    return f"{MONTH_NAMES_RU[month]} {year}"
+
+
+# ─── ConversationHandler states ───────────────────────────────────────────────
 (
     # Добавление сотрудника
     ADD_NAME, ADD_PHONE, ADD_POSITION, ADD_SECTION,
     ADD_SCHEDULE, ADD_DAYS_OFF, ADD_START_DATE,
-    # Редактирование
-    EDIT_FIELD, EDIT_VALUE,
+    # Редактирование сотрудника
+    EDIT_SELECT_EMP, EDIT_FIELD, EDIT_VALUE,
     # Смена
     SHIFT_SELECT_EMP, SHIFT_SELECT_DATE, SHIFT_SELECT_VALUE,
     SHIFT_IS_REPLACE, SHIFT_REPLACE_FOR,
     # Финансы
     FIN_SELECT_EMP, FIN_TYPE, FIN_VALUE,
     # Увольнение
-    FIRE_DATE,
+    FIRE_SELECT_EMP, FIRE_DATE,
+    # Удаление
+    DELETE_SELECT_EMP,
     # Добавление администратора
     NEW_ADMIN_ID,
-) = range(19)
-
-# Временное хранилище состояний разговора
-user_data_store: dict = {}
+) = range(22)
 
 
-def now_tz() -> datetime:
-    return datetime.now(tz=TZ)
+# ─── Клавиатуры ───────────────────────────────────────────────────────────────
 
-
-def is_authorized(chat_id: int) -> bool:
-    if chat_id == ADMIN_CHAT_ID:
-        return True
-    return chat_id in db.get_bot_admins()
-
-
-# ─── Главное меню ─────────────────────────────────────────────────────────────
-
-def main_menu_keyboard():
+def kb_main() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("✅ Отметить смены",        callback_data="menu_shift")],
-        [InlineKeyboardButton("👥 Сотрудники",            callback_data="menu_employees")],
-        [InlineKeyboardButton("💰 Аванс / Удержание",     callback_data="menu_finance")],
-        [InlineKeyboardButton("📊 Таблица",               callback_data="menu_table")],
-        [InlineKeyboardButton("⚙️ Настройки",             callback_data="menu_settings")],
+        [InlineKeyboardButton("👥 Сотрудники",    callback_data="menu:employees")],
+        [InlineKeyboardButton("📅 Смены",          callback_data="menu:shifts")],
+        [InlineKeyboardButton("💰 Финансы",        callback_data="menu:finance")],
+        [InlineKeyboardButton("📊 Таблица",        callback_data="menu:table")],
+        [InlineKeyboardButton("📁 Скачать .xlsx",  callback_data="menu:xlsx")],
+        [InlineKeyboardButton("⚙️ Настройки",      callback_data="menu:settings")],
     ])
 
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    if not is_authorized(chat_id):
-        await update.message.reply_text("⛔ Нет доступа.")
-        return
-    today = now_tz().date()
-    await update.message.reply_text(
-        f"📋 *Табель-бот*\n📅 {today.strftime('%d.%m.%Y')}\n\nВыберите действие:",
-        parse_mode="Markdown",
-        reply_markup=main_menu_keyboard()
-    )
-
-
-async def back_to_main(query, text="Главное меню:"):
-    await query.edit_message_text(
-        text, reply_markup=main_menu_keyboard(), parse_mode="Markdown"
-    )
-
-
-# ─── Отметка смен ─────────────────────────────────────────────────────────────
-
-async def menu_shift(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    today = now_tz().date()
-
-    keyboard = []
-    # Кнопки последних 7 дней + возможность выбрать любой день месяца
-    for i in range(7):
-        d = today - timedelta(days=i)
-        label = f"Сегодня {d.strftime('%d.%m')}" if i == 0 else d.strftime("%d.%m (%a)")
-        keyboard.append([InlineKeyboardButton(label, callback_data=f"shift_date_{d.isoformat()}")])
-
-    keyboard.append([InlineKeyboardButton("📅 Другой день месяца", callback_data="shift_pick_month")])
-    keyboard.append([InlineKeyboardButton("◀️ Назад", callback_data="back_main")])
-
-    await query.edit_message_text(
-        "✅ *Отметить смены*\nВыберите дату:",
-        parse_mode="Markdown",
-        reply_markup=InlineKeyboardMarkup(keyboard)
-    )
-
-
-async def shift_pick_month(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Показать все дни текущего месяца для выбора."""
-    query = update.callback_query
-    await query.answer()
-    today = now_tz().date()
-    total = days_in_month(today.year, today.month)
-
-    keyboard = []
-    row = []
-    for d in range(1, total + 1):
-        dd = date(today.year, today.month, d)
-        row.append(InlineKeyboardButton(str(d), callback_data=f"shift_date_{dd.isoformat()}"))
-        if len(row) == 7:
-            keyboard.append(row)
-            row = []
-    if row:
-        keyboard.append(row)
-    keyboard.append([InlineKeyboardButton("◀️ Назад", callback_data="menu_shift")])
-
-    await query.edit_message_text(
-        f"📅 {MONTH_NAMES_RU[today.month]} {today.year} — выберите день:",
-        reply_markup=InlineKeyboardMarkup(keyboard)
-    )
-
-
-async def shift_select_date(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """После выбора даты — показываем список сотрудников со статусами."""
-    query = update.callback_query
-    await query.answer()
-    chat_id = query.message.chat_id
-
-    date_str = query.data.replace("shift_date_", "")
-    sel_date = date.fromisoformat(date_str)
-    user_data_store[chat_id] = {"selected_date": sel_date}
-
-    await _show_shift_employees(query, chat_id, sel_date)
-
-
-async def _show_shift_employees(query, chat_id: int, sel_date: date):
-    """Показать всех сотрудников с кнопками для отметки."""
-    year, month, day = sel_date.year, sel_date.month, sel_date.day
-
-    # Читаем текущие значения из Sheets
-    try:
-        current_vals = sheets.read_day_values(year, month, day)
-    except Exception:
-        current_vals = {}
-
-    employees = db.get_all_employees()
-    keyboard = []
-
-    for section in SECTIONS:
-        sec_emps = [e for e in employees if e["section"] == section and not e.get("fired")]
-        if not sec_emps:
-            continue
-
-        # Заголовок раздела
-        keyboard.append([InlineKeyboardButton(
-            f"── {SECTION_LABELS[section]} ──", callback_data="noop"
-        )])
-
-        for emp in sec_emps:
-            val = current_vals.get(emp["id"], 0)
-            if val == 1:
-                icon = "✅"
-            elif val and val != 0:
-                icon = f"🔸{val}"
-            else:
-                icon = "⬜"
-
-            short_name = " ".join(emp["name"].split()[:2])
-            replace_mark = " 🔄" if emp.get("is_replacement_for") else ""
-            keyboard.append([InlineKeyboardButton(
-                f"{icon} {short_name}{replace_mark}",
-                callback_data=f"shift_emp_{emp['id']}_{sel_date.isoformat()}"
-            )])
-
-    keyboard.append([
-        InlineKeyboardButton("🔄 Обновить", callback_data=f"shift_date_{sel_date.isoformat()}"),
-        InlineKeyboardButton("◀️ Назад",    callback_data="menu_shift"),
-    ])
-
-    await query.edit_message_text(
-        f"📅 *{sel_date.strftime('%d.%m.%Y')}* — отметьте сотрудников:\n"
-        "✅ = 1  🔸 = частично  ⬜ = 0",
-        parse_mode="Markdown",
-        reply_markup=InlineKeyboardMarkup(keyboard)
-    )
-
-
-async def shift_select_employee(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Выбор значения для конкретного сотрудника."""
-    query = update.callback_query
-    await query.answer()
-    chat_id = query.message.chat_id
-
-    _, _, emp_id_str, date_str = query.data.split("_", 3)
-    emp_id = int(emp_id_str)
-    sel_date = date.fromisoformat(date_str)
-    emp = db.get_employee(emp_id)
-    if not emp:
-        return
-
-    user_data_store[chat_id] = {"selected_date": sel_date, "selected_emp": emp_id}
-
-    section = emp.get("section", "")
-    name = emp["name"]
-
-    if section == "runners":
-        # Для раннеров — ввод часов текстом
-        user_data_store[chat_id]["awaiting"] = "runner_hours"
-        keyboard = [[InlineKeyboardButton("◀️ Назад", callback_data=f"shift_date_{date_str}")]]
-        await query.edit_message_text(
-            f"⏱ *{name}*\n📅 {sel_date.strftime('%d.%m.%Y')}\n\n"
-            "Введите количество отработанных часов (например: 8, 6.5, 12):",
-            parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup(keyboard)
-        )
-        return
-
-    if section == "tech" and emp.get("position", "").lower() in ("сторож", "дворник-сторож"):
-        # Сторожа — только 1 или 0
-        values = [("✅ Работал (1)", 1), ("❌ Не работал (0)", 0)]
-    else:
-        values = [
-            ("✅ Полная смена (1)",  1),
-            ("🔸 0.7 смены",         0.7),
-            ("🔸 0.5 смены",         0.5),
-            ("🔸 0.3 смены",         0.3),
-            ("❌ Не работал (0)",    0),
-        ]
-
-    keyboard = []
-    for label, val in values:
-        keyboard.append([InlineKeyboardButton(
-            label, callback_data=f"shift_set_{emp_id}_{date_str}_{val}"
-        )])
-
-    # Кнопка "это замена"
-    keyboard.append([InlineKeyboardButton(
-        "🔄 Это замена другого сотрудника",
-        callback_data=f"shift_is_replace_{emp_id}_{date_str}"
-    )])
-    keyboard.append([InlineKeyboardButton("◀️ Назад", callback_data=f"shift_date_{date_str}")])
-
-    await query.edit_message_text(
-        f"👤 *{name}*\n"
-        f"📅 {sel_date.strftime('%d.%m.%Y')} | {emp.get('position', '')} | {emp.get('schedule', '')}\n\n"
-        "Выберите статус:",
-        parse_mode="Markdown",
-        reply_markup=InlineKeyboardMarkup(keyboard)
-    )
-
-
-async def shift_set_value(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Записать значение смены."""
-    query = update.callback_query
-    await query.answer()
-
-    parts = query.data.split("_")
-    # shift_set_{emp_id}_{date}_{value}
-    emp_id = int(parts[2])
-    date_str = parts[3]
-    value = float(parts[4])
-    sel_date = date.fromisoformat(date_str)
-
-    try:
-        ok = sheets.write_shift(emp_id, sel_date.day, value, sel_date.year, sel_date.month)
-        if ok:
-            emp = db.get_employee(emp_id)
-            await query.answer(f"✅ Сохранено: {emp['name']} = {value}", show_alert=False)
-        else:
-            await query.answer("❌ Ошибка: сотрудник не найден в таблице", show_alert=True)
-    except Exception as e:
-        logger.error(e)
-        await query.answer(f"❌ Ошибка записи: {e}", show_alert=True)
-
-    # Вернуться к списку
-    await _show_shift_employees(query, query.message.chat_id, sel_date)
-
-
-async def shift_is_replace(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Пометить что это замена — показать кого заменяет."""
-    query = update.callback_query
-    await query.answer()
-    chat_id = query.message.chat_id
-
-    parts = query.data.split("_")
-    replacer_id = int(parts[3])
-    date_str = parts[4]
-    sel_date = date.fromisoformat(date_str)
-
-    # Показываем список сотрудников для выбора "кого заменяет"
-    employees = [e for e in db.get_all_employees()
-                 if e["id"] != replacer_id and not e.get("fired")
-                 and not e.get("is_replacement_for")]
-
-    keyboard = []
-    for emp in employees:
-        short = " ".join(emp["name"].split()[:2])
-        keyboard.append([InlineKeyboardButton(
-            f"{short} ({SECTION_LABELS.get(emp['section'], '')})",
-            callback_data=f"shift_replace_for_{replacer_id}_{date_str}_{emp['id']}"
-        )])
-    keyboard.append([InlineKeyboardButton("◀️ Назад", callback_data=f"shift_emp_{replacer_id}_{date_str}")])
-
-    replacer = db.get_employee(replacer_id)
-    await query.edit_message_text(
-        f"🔄 *{replacer['name']}* заменяет кого?",
-        parse_mode="Markdown",
-        reply_markup=InlineKeyboardMarkup(keyboard)
-    )
-
-
-async def shift_replace_for(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Установить связь замены и записать смену."""
-    query = update.callback_query
-    await query.answer()
-
-    parts = query.data.split("_")
-    # shift_replace_for_{replacer_id}_{date}_{main_id}
-    replacer_id = int(parts[3])
-    date_str = parts[4]
-    main_id = int(parts[5])
-    sel_date = date.fromisoformat(date_str)
-
-    replacer = db.get_employee(replacer_id)
-    main_emp = db.get_employee(main_id)
-
-    # Проверяем: есть ли уже строка замены этого сотрудника за этим основным
-    existing = db.find_replacement_row(main_id, replacer["name"])
-    if not existing:
-        # Создаём строку-замену
-        new_emp = db.add_employee({
-            "name": replacer["name"],
-            "phone": replacer.get("phone", ""),
-            "position": replacer.get("position", ""),
-            "section": main_emp["section"],
-            "schedule": replacer.get("schedule", ""),
-            "is_replacement_for": main_id,
-        })
-        replacer_row_id = new_emp["id"]
-        # Нужно пересобрать лист чтобы добавить строку
-        try:
-            sheets.build_sheet(sel_date.year, sel_date.month)
-        except Exception as e:
-            logger.error(f"build_sheet error: {e}")
-    else:
-        replacer_row_id = existing["id"]
-
-    # Записываем значение 1 в строку заменяющего
-    try:
-        sheets.write_shift(replacer_row_id, sel_date.day, 1, sel_date.year, sel_date.month)
-        await query.answer(
-            f"✅ {replacer['name']} → замена за {main_emp['name']}",
-            show_alert=False
-        )
-    except Exception as e:
-        await query.answer(f"❌ Ошибка: {e}", show_alert=True)
-
-    await _show_shift_employees(query, query.message.chat_id, sel_date)
-
-
-async def handle_runner_hours(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработка ввода часов для раннера."""
-    chat_id = update.effective_chat.id
-    state = user_data_store.get(chat_id, {})
-
-    if state.get("awaiting") != "runner_hours":
-        return
-
-    text = update.message.text.strip().replace(",", ".")
-    try:
-        hours = float(text)
-    except ValueError:
-        await update.message.reply_text("❌ Введите число, например: 8 или 6.5")
-        return
-
-    emp_id = state["selected_emp"]
-    sel_date = state["selected_date"]
-
-    try:
-        sheets.write_shift(emp_id, sel_date.day, hours, sel_date.year, sel_date.month)
-        emp = db.get_employee(emp_id)
-        await update.message.reply_text(
-            f"✅ *{emp['name']}* — {hours} ч за {sel_date.strftime('%d.%m')} сохранено.",
-            parse_mode="Markdown"
-        )
-    except Exception as e:
-        await update.message.reply_text(f"❌ Ошибка: {e}")
-
-    user_data_store.pop(chat_id, None)
-
-
-# ─── Меню сотрудников ─────────────────────────────────────────────────────────
-
-async def menu_employees(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-
-    keyboard = [
-        [InlineKeyboardButton("➕ Добавить сотрудника",    callback_data="emp_add")],
-        [InlineKeyboardButton("📋 Список сотрудников",     callback_data="emp_list")],
-        [InlineKeyboardButton("✏️ Редактировать",          callback_data="emp_edit_pick")],
-        [InlineKeyboardButton("🔴 Уволить сотрудника",     callback_data="emp_fire_pick")],
-        [InlineKeyboardButton("◀️ Назад",                  callback_data="back_main")],
-    ]
-    await query.edit_message_text(
-        "👥 *Сотрудники*", parse_mode="Markdown",
-        reply_markup=InlineKeyboardMarkup(keyboard)
-    )
-
-
-async def emp_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-
-    employees = db.get_all_employees()
-    if not employees:
-        await query.edit_message_text(
-            "Список сотрудников пуст.",
-            reply_markup=InlineKeyboardMarkup([[
-                InlineKeyboardButton("◀️ Назад", callback_data="menu_employees")
-            ]])
-        )
-        return
-
-    text = "👥 *Список сотрудников:*\n\n"
-    for section in SECTIONS:
-        sec_emps = [e for e in employees if e["section"] == section]
-        if not sec_emps:
-            continue
-        text += f"*{SECTION_LABELS[section]}*\n"
-        for e in sec_emps:
-            fired = " 🔴уволен" if e.get("fired") else ""
-            replace = f" (→ замена за ID{e['is_replacement_for']})" if e.get("is_replacement_for") else ""
-            text += f"  • {e['name']} | {e.get('schedule','')} | {e.get('phone','')}{fired}{replace}\n"
-        text += "\n"
-
-    keyboard = [[InlineKeyboardButton("◀️ Назад", callback_data="menu_employees")]]
-    await query.edit_message_text(text, parse_mode="Markdown",
-                                   reply_markup=InlineKeyboardMarkup(keyboard))
-
-
-# ─── Добавление сотрудника (ConversationHandler) ──────────────────────────────
-
-async def emp_add_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    chat_id = query.message.chat_id
-    user_data_store[chat_id] = {"adding_emp": {}}
-    await query.edit_message_text(
-        "➕ *Добавление сотрудника*\n\nВведите ФИО:",
-        parse_mode="Markdown",
-        reply_markup=InlineKeyboardMarkup([[
-            InlineKeyboardButton("❌ Отмена", callback_data="menu_employees")
-        ]])
-    )
-    return ADD_NAME
-
-
-async def emp_add_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    user_data_store[chat_id]["adding_emp"]["name"] = update.message.text.strip()
-    await update.message.reply_text(
-        "📱 Введите номер телефона (или напишите '-' чтобы пропустить):"
-    )
-    return ADD_PHONE
-
-
-async def emp_add_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    phone = update.message.text.strip()
-    user_data_store[chat_id]["adding_emp"]["phone"] = "" if phone == "-" else phone
-    await update.message.reply_text("💼 Введите должность (например: Администратор, Кассир, Официант):")
-    return ADD_POSITION
-
-
-async def emp_add_position(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    user_data_store[chat_id]["adding_emp"]["position"] = update.message.text.strip()
-
-    keyboard = []
-    for sec_id, sec_label in SECTION_LABELS.items():
-        keyboard.append([InlineKeyboardButton(sec_label, callback_data=f"emp_section_{sec_id}")])
-
-    await update.message.reply_text(
-        "📂 Выберите раздел:",
-        reply_markup=InlineKeyboardMarkup(keyboard)
-    )
-    return ADD_SECTION
-
-
-async def emp_add_section(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    chat_id = query.message.chat_id
-    section = query.data.replace("emp_section_", "")
-    user_data_store[chat_id]["adding_emp"]["section"] = section
-
-    keyboard = [
-        [InlineKeyboardButton("2/2",         callback_data="emp_sched_2/2")],
-        [InlineKeyboardButton("5/2",         callback_data="emp_sched_5/2")],
-        [InlineKeyboardButton("7/0 (каждый день)", callback_data="emp_sched_7/0")],
-        [InlineKeyboardButton("Свободный",   callback_data="emp_sched_свободный")],
-    ]
-    await query.edit_message_text(
-        "📅 Выберите график:",
-        reply_markup=InlineKeyboardMarkup(keyboard)
-    )
-    return ADD_SCHEDULE
-
-
-async def emp_add_schedule(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    chat_id = query.message.chat_id
-    schedule = query.data.replace("emp_sched_", "")
-    user_data_store[chat_id]["adding_emp"]["schedule"] = schedule
-
-    if schedule == "5/2":
-        keyboard = [
-            [InlineKeyboardButton("Пн+Вт", callback_data="emp_doff_0,1")],
-            [InlineKeyboardButton("Вт+Ср", callback_data="emp_doff_1,2")],
-            [InlineKeyboardButton("Ср+Чт", callback_data="emp_doff_2,3")],
-            [InlineKeyboardButton("Чт+Пт", callback_data="emp_doff_3,4")],
-            [InlineKeyboardButton("Пт+Сб", callback_data="emp_doff_4,5")],
-            [InlineKeyboardButton("Сб+Вс", callback_data="emp_doff_5,6")],
-            [InlineKeyboardButton("Вс+Пн", callback_data="emp_doff_6,0")],
-        ]
-        await query.edit_message_text(
-            "🗓 Выберите выходные дни (5/2):",
-            reply_markup=InlineKeyboardMarkup(keyboard)
-        )
-        return ADD_DAYS_OFF
-
-    elif schedule == "2/2":
-        await query.edit_message_text(
-            "📅 Введите стартовую рабочую дату сотрудника (первый рабочий день) в формате ДД.ММ.ГГГГ:"
-        )
-        return ADD_START_DATE
-
-    else:
-        # свободный или 7/0
-        return await _finalize_emp_add(query, chat_id)
-
-
-async def emp_add_days_off(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    chat_id = query.message.chat_id
-    days_off = [int(x) for x in query.data.replace("emp_doff_", "").split(",")]
-    user_data_store[chat_id]["adding_emp"]["days_off"] = days_off
-    return await _finalize_emp_add(query, chat_id)
-
-
-async def emp_add_start_date(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    text = update.message.text.strip()
-    try:
-        d = datetime.strptime(text, "%d.%m.%Y")
-        user_data_store[chat_id]["adding_emp"]["start_date"] = d.strftime("%Y-%m-%d")
-    except ValueError:
-        await update.message.reply_text("❌ Неверный формат. Введите дату в формате ДД.ММ.ГГГГ:")
-        return ADD_START_DATE
-
-    emp_data = user_data_store[chat_id]["adding_emp"]
-    emp = db.add_employee(emp_data)
-    await update.message.reply_text(
-        f"✅ Сотрудник *{emp['name']}* добавлен!\n\n"
-        f"Не забудьте пересобрать таблицу через меню 📊 Таблица → Пересобрать.",
-        parse_mode="Markdown",
-        reply_markup=InlineKeyboardMarkup([[
-            InlineKeyboardButton("👥 К сотрудникам", callback_data="menu_employees")
-        ]])
-    )
-    user_data_store.pop(chat_id, None)
-    return ConversationHandler.END
-
-
-async def _finalize_emp_add(query_or_msg, chat_id: int):
-    emp_data = user_data_store[chat_id]["adding_emp"]
-    emp = db.add_employee(emp_data)
-
-    text = (
-        f"✅ Сотрудник *{emp['name']}* добавлен!\n\n"
-        f"Не забудьте пересобрать таблицу через меню 📊 Таблица → Пересобрать."
-    )
-    kb = InlineKeyboardMarkup([[
-        InlineKeyboardButton("👥 К сотрудникам", callback_data="menu_employees")
+def kb_cancel() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("❌ Отмена", callback_data="cancel"),
     ]])
 
-    if hasattr(query_or_msg, "edit_message_text"):
-        await query_or_msg.edit_message_text(text, parse_mode="Markdown", reply_markup=kb)
-    else:
-        await query_or_msg.reply_text(text, parse_mode="Markdown", reply_markup=kb)
+def kb_skip_cancel() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("⏭ Пропустить", callback_data="skip"),
+        InlineKeyboardButton("❌ Отмена",     callback_data="cancel"),
+    ]])
 
-    user_data_store.pop(chat_id, None)
+def kb_employees() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("➕ Добавить",     callback_data="emp:add")],
+        [InlineKeyboardButton("✏️ Редактировать", callback_data="emp:edit")],
+        [InlineKeyboardButton("🔥 Уволить",       callback_data="emp:fire")],
+        [InlineKeyboardButton("🗑 Удалить",        callback_data="emp:delete")],
+        [InlineKeyboardButton("📋 Список",         callback_data="emp:list")],
+        [InlineKeyboardButton("❌ Отмена",         callback_data="cancel")],
+    ])
+
+def kb_shifts() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ Отметить смену",    callback_data="shift:mark")],
+        [InlineKeyboardButton("✏️ Исправить смену",   callback_data="shift:edit")],
+        [InlineKeyboardButton("❌ Отмена",            callback_data="cancel")],
+    ])
+
+def kb_finance() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("💵 Аванс",       callback_data="fin:advance")],
+        [InlineKeyboardButton("📉 Удержание",   callback_data="fin:deduction")],
+        [InlineKeyboardButton("❌ Отмена",       callback_data="cancel")],
+    ])
+
+def kb_table() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🆕 Создать/пересобрать таблицу", callback_data="table:build")],
+        [InlineKeyboardButton("❌ Отмена",                       callback_data="cancel")],
+    ])
+
+def kb_sections() -> InlineKeyboardMarkup:
+    buttons = [
+        [InlineKeyboardButton(SECTION_LABELS[s], callback_data=f"sec:{s}")]
+        for s in SECTIONS
+    ]
+    buttons.append([InlineKeyboardButton("❌ Отмена", callback_data="cancel")])
+    return InlineKeyboardMarkup(buttons)
+
+def kb_schedules(section: str) -> InlineKeyboardMarkup:
+    mapping = {
+        "admins":      ["2/2"],
+        "waiters_day": ["5/2"],
+        "waiters_eve": ["5/2"],
+        "runners":     ["свободный"],
+        "tech":        ["2/2", "7/0"],
+    }
+    scheds = mapping.get(section, ["2/2", "5/2", "7/0", "свободный"])
+    buttons = [
+        [InlineKeyboardButton(s, callback_data=f"sch:{s}")]
+        for s in scheds
+    ]
+    buttons.append([InlineKeyboardButton("❌ Отмена", callback_data="cancel")])
+    return InlineKeyboardMarkup(buttons)
+
+def kb_days_off(selected: list) -> InlineKeyboardMarkup:
+    names = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
+    row = [
+        InlineKeyboardButton(
+            f"{'✅' if i in selected else ''}{names[i]}",
+            callback_data=f"doff:{i}"
+        )
+        for i in range(7)
+    ]
+    return InlineKeyboardMarkup([
+        row[:4], row[4:],
+        [
+            InlineKeyboardButton("✔️ Готово", callback_data="doff:done"),
+            InlineKeyboardButton("❌ Отмена", callback_data="cancel"),
+        ],
+    ])
+
+def kb_employees_list(employees: list, prefix: str,
+                       skip_replacements: bool = True) -> InlineKeyboardMarkup:
+    buttons = []
+    for e in employees:
+        if skip_replacements and e.get("is_replacement_for"):
+            continue
+        name = e["name"]
+        if e.get("fired"):
+            name = f"🚫 {name}"
+        buttons.append([InlineKeyboardButton(name, callback_data=f"{prefix}:{e['id']}")])
+    buttons.append([InlineKeyboardButton("❌ Отмена", callback_data="cancel")])
+    return InlineKeyboardMarkup(buttons)
+
+def kb_day_picker(year: int, month: int) -> InlineKeyboardMarkup:
+    total = days_in_month(year, month)
+    buttons = []
+    row = []
+    for d in range(1, total + 1):
+        row.append(InlineKeyboardButton(str(d), callback_data=f"day:{d}"))
+        if len(row) == 7:
+            buttons.append(row)
+            row = []
+    if row:
+        buttons.append(row)
+    t = today_tz()
+    if t.year == year and t.month == month:
+        buttons.append([
+            InlineKeyboardButton(f"📅 Сегодня ({t.day})", callback_data=f"day:{t.day}")
+        ])
+    buttons.append([InlineKeyboardButton("❌ Отмена", callback_data="cancel")])
+    return InlineKeyboardMarkup(buttons)
+
+def kb_shift_values(section: str) -> InlineKeyboardMarkup:
+    if section == "runners":
+        return InlineKeyboardMarkup([[
+            InlineKeyboardButton("❌ Отмена", callback_data="cancel"),
+        ]])
+    if section == "tech":
+        rows = [
+            [InlineKeyboardButton("1 — вышел",    callback_data="val:1")],
+            [InlineKeyboardButton("0 — не вышел", callback_data="val:0")],
+        ]
+    else:
+        rows = [
+            [InlineKeyboardButton("1 — полная смена",  callback_data="val:1")],
+            [InlineKeyboardButton("0.7",               callback_data="val:0.7")],
+            [InlineKeyboardButton("0.5",               callback_data="val:0.5")],
+            [InlineKeyboardButton("0.3",               callback_data="val:0.3")],
+            [InlineKeyboardButton("0 — не вышел",      callback_data="val:0")],
+        ]
+    rows.append([InlineKeyboardButton("❌ Отмена", callback_data="cancel")])
+    return InlineKeyboardMarkup(rows)
+
+def kb_yes_no(yes_data: str, no_data: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("✅ Да", callback_data=yes_data),
+        InlineKeyboardButton("❌ Нет", callback_data=no_data),
+    ]])
+
+def kb_edit_fields() -> InlineKeyboardMarkup:
+    fields = [
+        ("ФИО",        "name"),
+        ("Телефон",    "phone"),
+        ("Должность",  "position"),
+        ("График",     "schedule"),
+        ("Выходные",   "days_off"),
+        ("Дата старта (2/2)", "start_date"),
+    ]
+    buttons = [[InlineKeyboardButton(label, callback_data=f"field:{key}")]
+               for label, key in fields]
+    buttons.append([InlineKeyboardButton("❌ Отмена", callback_data="cancel")])
+    return InlineKeyboardMarkup(buttons)
+
+
+# ─── /start ───────────────────────────────────────────────────────────────────
+
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_authorized(update.effective_chat.id):
+        await update.message.reply_text("⛔ Нет доступа.")
+        return
+    await update.message.reply_text("👋 Привет! Я Табель-бот. Выберите действие:",
+                                    reply_markup=kb_main())
+
+async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data.clear()
+    await update.message.reply_text("Отменено.", reply_markup=kb_main())
+    return ConversationHandler.END
+
+async def cb_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data.clear()
+    await update.callback_query.answer()
+    await update.callback_query.edit_message_text("Отменено.")
     return ConversationHandler.END
 
 
-# ─── Редактирование сотрудника ────────────────────────────────────────────────
+# ─── Главное меню (callback) ──────────────────────────────────────────────────
 
-async def emp_edit_pick(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-
-    employees = [e for e in db.get_all_employees() if not e.get("fired") and not e.get("is_replacement_for")]
-    if not employees:
-        await query.edit_message_text(
-            "Нет сотрудников для редактирования.",
-            reply_markup=InlineKeyboardMarkup([[
-                InlineKeyboardButton("◀️ Назад", callback_data="menu_employees")
-            ]])
-        )
+async def cb_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    if not is_authorized(q.from_user.id):
+        await q.answer("⛔ Нет доступа.")
         return
+    await q.answer()
+    action = q.data.split(":")[1]
 
-    keyboard = []
-    for emp in employees:
-        short = " ".join(emp["name"].split()[:2])
-        sec = SECTION_LABELS.get(emp["section"], "")
-        keyboard.append([InlineKeyboardButton(
-            f"{short} ({sec})", callback_data=f"emp_edit_{emp['id']}"
-        )])
-    keyboard.append([InlineKeyboardButton("◀️ Назад", callback_data="menu_employees")])
+    if action == "employees":
+        await q.edit_message_text("👥 Сотрудники:", reply_markup=kb_employees())
+    elif action == "shifts":
+        await q.edit_message_text("📅 Смены:", reply_markup=kb_shifts())
+    elif action == "finance":
+        await q.edit_message_text("💰 Финансы:", reply_markup=kb_finance())
+    elif action == "table":
+        await q.edit_message_text("📊 Таблица:", reply_markup=kb_table())
+    elif action == "xlsx":
+        await q.edit_message_text("⏳ Формирую .xlsx, подождите…")
+        await _action_send_xlsx(update, context)
+    elif action == "settings":
+        await _action_settings(update, context)
 
-    await query.edit_message_text(
-        "✏️ Выберите сотрудника для редактирования:",
-        reply_markup=InlineKeyboardMarkup(keyboard)
+
+# ─── Список сотрудников ───────────────────────────────────────────────────────
+
+async def cb_emp_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    employees = db.get_all_employees()
+    if not employees:
+        await q.edit_message_text("Список пуст.", reply_markup=kb_main())
+        return
+    lines = []
+    for sec in SECTIONS:
+        sec_emps = [e for e in employees
+                    if e["section"] == sec and not e.get("is_replacement_for")]
+        if not sec_emps:
+            continue
+        lines.append(f"\n<b>{SECTION_LABELS[sec]}</b>")
+        for e in sec_emps:
+            status = " 🚫" if e.get("fired") else ""
+            lines.append(f"  • {e['name']}{status} | {e.get('schedule','')} | {e.get('phone','')}")
+    await q.edit_message_text("\n".join(lines) or "Список пуст.",
+                              parse_mode="HTML", reply_markup=kb_cancel())
+
+
+# ════════════════════════════════════════════════════════════════════
+#  ДОБАВЛЕНИЕ СОТРУДНИКА
+# ════════════════════════════════════════════════════════════════════
+
+async def conv_add_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    context.user_data.clear()
+    await q.edit_message_text("Введите ФИО сотрудника:", reply_markup=kb_cancel())
+    return ADD_NAME
+
+async def conv_add_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["name"] = update.message.text.strip()
+    await update.message.reply_text("Введите номер телефона (или пропустите):",
+                                    reply_markup=kb_skip_cancel())
+    return ADD_PHONE
+
+async def conv_add_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["phone"] = update.message.text.strip()
+    await update.message.reply_text("Введите должность (напр. «Официант», «Кассир»):",
+                                    reply_markup=kb_cancel())
+    return ADD_POSITION
+
+async def conv_add_phone_skip(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["phone"] = ""
+    await update.callback_query.answer()
+    await update.callback_query.edit_message_text("Введите должность:",
+                                                  reply_markup=kb_cancel())
+    return ADD_POSITION
+
+async def conv_add_position(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["position"] = update.message.text.strip()
+    await update.message.reply_text("Выберите раздел:", reply_markup=kb_sections())
+    return ADD_SECTION
+
+async def conv_add_section(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    section = q.data.split(":")[1]
+    context.user_data["section"] = section
+    await q.edit_message_text("Выберите график:", reply_markup=kb_schedules(section))
+    return ADD_SCHEDULE
+
+async def conv_add_schedule(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    schedule = q.data.split(":")[1]
+    context.user_data["schedule"] = schedule
+    context.user_data["days_off"] = []
+
+    if schedule == "5/2":
+        await q.edit_message_text(
+            "Выберите выходные дни сотрудника (можно несколько), затем «Готово»:",
+            reply_markup=kb_days_off([])
+        )
+        return ADD_DAYS_OFF
+    elif schedule == "2/2":
+        await q.edit_message_text(
+            "Введите дату начала цикла (первый рабочий день) в формате ДД.ММ.ГГГГ:",
+            reply_markup=kb_cancel()
+        )
+        return ADD_START_DATE
+    else:
+        # 7/0 или свободный — сохраняем сразу
+        return await _finish_add_employee(q, context)
+
+async def conv_add_days_off(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    val = q.data.split(":")[1]
+    if val == "done":
+        if not context.user_data.get("days_off"):
+            await q.answer("Выберите хотя бы один выходной день!", show_alert=True)
+            return ADD_DAYS_OFF
+        return await _finish_add_employee(q, context)
+    day_idx = int(val)
+    selected = context.user_data.setdefault("days_off", [])
+    if day_idx in selected:
+        selected.remove(day_idx)
+    else:
+        selected.append(day_idx)
+    await q.edit_message_text(
+        "Выберите выходные дни сотрудника, затем «Готово»:",
+        reply_markup=kb_days_off(selected)
+    )
+    return ADD_DAYS_OFF
+
+async def conv_add_start_date(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    raw = update.message.text.strip()
+    try:
+        dt = datetime.strptime(raw, "%d.%m.%Y")
+        context.user_data["start_date"] = dt.strftime("%Y-%m-%d")
+    except ValueError:
+        await update.message.reply_text("Неверный формат. Введите ДД.ММ.ГГГГ:",
+                                        reply_markup=kb_cancel())
+        return ADD_START_DATE
+    return await _finish_add_employee(update.message, context)
+
+async def _finish_add_employee(msg_or_query, context: ContextTypes.DEFAULT_TYPE):
+    data = context.user_data
+    emp = db.add_employee({
+        "name":       data["name"],
+        "phone":      data.get("phone", ""),
+        "position":   data.get("position", ""),
+        "section":    data["section"],
+        "schedule":   data.get("schedule", ""),
+        "days_off":   data.get("days_off", []),
+        "start_date": data.get("start_date", ""),
+    })
+    text = (f"✅ Сотрудник добавлен:\n"
+            f"<b>{emp['name']}</b> | {emp['position']} | {emp['schedule']}")
+    if hasattr(msg_or_query, "edit_message_text"):
+        await msg_or_query.edit_message_text(text, parse_mode="HTML")
+    else:
+        await msg_or_query.reply_text(text, parse_mode="HTML")
+    context.user_data.clear()
+    return ConversationHandler.END
+
+
+def conv_add_employee() -> ConversationHandler:
+    return ConversationHandler(
+        entry_points=[CallbackQueryHandler(conv_add_start, pattern="^emp:add$")],
+        states={
+            ADD_NAME:       [MessageHandler(filters.TEXT & ~filters.COMMAND, conv_add_name)],
+            ADD_PHONE: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, conv_add_phone),
+                CallbackQueryHandler(conv_add_phone_skip, pattern="^skip$"),
+            ],
+            ADD_POSITION:   [MessageHandler(filters.TEXT & ~filters.COMMAND, conv_add_position)],
+            ADD_SECTION:    [CallbackQueryHandler(conv_add_section,  pattern="^sec:")],
+            ADD_SCHEDULE:   [CallbackQueryHandler(conv_add_schedule, pattern="^sch:")],
+            ADD_DAYS_OFF:   [CallbackQueryHandler(conv_add_days_off, pattern="^doff:")],
+            ADD_START_DATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, conv_add_start_date)],
+        },
+        fallbacks=[
+            CommandHandler("cancel", cmd_cancel),
+            CallbackQueryHandler(cb_cancel, pattern="^cancel$"),
+        ],
+        per_message=False,
     )
 
 
-async def emp_edit_select(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    chat_id = query.message.chat_id
+# ════════════════════════════════════════════════════════════════════
+#  РЕДАКТИРОВАНИЕ СОТРУДНИКА
+# ════════════════════════════════════════════════════════════════════
 
-    emp_id = int(query.data.replace("emp_edit_", ""))
+async def conv_edit_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    employees = db.get_all_employees()
+    if not employees:
+        await q.edit_message_text("Нет сотрудников.", reply_markup=kb_main())
+        return ConversationHandler.END
+    await q.edit_message_text("Выберите сотрудника:",
+                               reply_markup=kb_employees_list(employees, "esel"))
+    return EDIT_SELECT_EMP
+
+async def conv_edit_select_emp(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    emp_id = int(q.data.split(":")[1])
     emp = db.get_employee(emp_id)
-    user_data_store[chat_id] = {"editing_emp": emp_id}
+    if not emp:
+        await q.edit_message_text("Сотрудник не найден.")
+        return ConversationHandler.END
+    context.user_data["edit_emp_id"] = emp_id
+    info = (f"<b>{emp['name']}</b>\n"
+            f"Телефон: {emp.get('phone','—')}\n"
+            f"Должность: {emp.get('position','—')}\n"
+            f"График: {emp.get('schedule','—')}\n"
+            f"Выходные: {emp.get('days_off','—')}\n"
+            f"Дата старта: {emp.get('start_date','—')}")
+    await q.edit_message_text(f"{info}\n\nЧто изменить?",
+                               parse_mode="HTML", reply_markup=kb_edit_fields())
+    return EDIT_FIELD
 
-    keyboard = [
-        [InlineKeyboardButton("Имя",       callback_data=f"emp_editf_{emp_id}_name")],
-        [InlineKeyboardButton("Телефон",   callback_data=f"emp_editf_{emp_id}_phone")],
-        [InlineKeyboardButton("Должность", callback_data=f"emp_editf_{emp_id}_position")],
-        [InlineKeyboardButton("◀️ Назад",   callback_data="emp_edit_pick")],
-    ]
-    await query.edit_message_text(
-        f"✏️ *{emp['name']}*\nЧто редактируем?",
-        parse_mode="Markdown",
-        reply_markup=InlineKeyboardMarkup(keyboard)
-    )
+async def conv_edit_field(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    field = q.data.split(":")[1]
+    context.user_data["edit_field"] = field
 
+    if field == "days_off":
+        emp = db.get_employee(context.user_data["edit_emp_id"])
+        context.user_data["days_off"] = list(emp.get("days_off", []))
+        await q.edit_message_text("Выберите новые выходные дни:",
+                                   reply_markup=kb_days_off(context.user_data["days_off"]))
+        return EDIT_VALUE
+    elif field == "schedule":
+        emp = db.get_employee(context.user_data["edit_emp_id"])
+        await q.edit_message_text("Выберите новый график:",
+                                   reply_markup=kb_schedules(emp.get("section", "")))
+        return EDIT_VALUE
+    else:
+        labels = {
+            "name": "ФИО", "phone": "телефон", "position": "должность",
+            "start_date": "дату старта (ДД.ММ.ГГГГ)",
+        }
+        await q.edit_message_text(f"Введите {labels.get(field, field)}:",
+                                   reply_markup=kb_cancel())
+        return EDIT_VALUE
 
-async def emp_edit_field(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    chat_id = query.message.chat_id
+async def conv_edit_value_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    field = context.user_data.get("edit_field")
+    raw = update.message.text.strip()
+    emp_id = context.user_data["edit_emp_id"]
 
-    _, _, emp_id_str, field = query.data.split("_", 3)
-    emp_id = int(emp_id_str)
-    user_data_store[chat_id] = {"editing_emp": emp_id, "editing_field": field}
+    if field == "start_date":
+        try:
+            dt = datetime.strptime(raw, "%d.%m.%Y")
+            raw = dt.strftime("%Y-%m-%d")
+        except ValueError:
+            await update.message.reply_text("Неверный формат. Введите ДД.ММ.ГГГГ:",
+                                            reply_markup=kb_cancel())
+            return EDIT_VALUE
 
-    field_labels = {"name": "ФИО", "phone": "телефон", "position": "должность"}
-    await query.edit_message_text(
-        f"✏️ Введите новое значение для *{field_labels.get(field, field)}*:",
-        parse_mode="Markdown",
-        reply_markup=InlineKeyboardMarkup([[
-            InlineKeyboardButton("❌ Отмена", callback_data="menu_employees")
-        ]])
-    )
+    db.update_employee(emp_id, {field: raw})
+    await update.message.reply_text(f"✅ Поле «{field}» обновлено.")
+    context.user_data.clear()
+    return ConversationHandler.END
+
+async def conv_edit_value_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    field = context.user_data.get("edit_field")
+    emp_id = context.user_data["edit_emp_id"]
+
+    if field == "days_off":
+        val = q.data.split(":")[1]
+        if val == "done":
+            db.update_employee(emp_id, {"days_off": context.user_data["days_off"]})
+            await q.edit_message_text("✅ Выходные обновлены.")
+            context.user_data.clear()
+            return ConversationHandler.END
+        idx = int(val)
+        selected = context.user_data.setdefault("days_off", [])
+        if idx in selected:
+            selected.remove(idx)
+        else:
+            selected.append(idx)
+        await q.edit_message_text("Выберите новые выходные дни:",
+                                   reply_markup=kb_days_off(selected))
+        return EDIT_VALUE
+
+    elif field == "schedule":
+        schedule = q.data.split(":")[1]
+        db.update_employee(emp_id, {"schedule": schedule})
+        await q.edit_message_text(f"✅ График обновлён: {schedule}")
+        context.user_data.clear()
+        return ConversationHandler.END
+
     return EDIT_VALUE
 
 
-async def emp_edit_value(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    state = user_data_store.get(chat_id, {})
-    emp_id = state.get("editing_emp")
-    field = state.get("editing_field")
+def conv_edit_employee() -> ConversationHandler:
+    return ConversationHandler(
+        entry_points=[CallbackQueryHandler(conv_edit_start, pattern="^emp:edit$")],
+        states={
+            EDIT_SELECT_EMP: [CallbackQueryHandler(conv_edit_select_emp, pattern="^esel:")],
+            EDIT_FIELD:      [CallbackQueryHandler(conv_edit_field,      pattern="^field:")],
+            EDIT_VALUE: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, conv_edit_value_text),
+                CallbackQueryHandler(conv_edit_value_cb, pattern="^(doff:|sch:)"),
+            ],
+        },
+        fallbacks=[
+            CommandHandler("cancel", cmd_cancel),
+            CallbackQueryHandler(cb_cancel, pattern="^cancel$"),
+        ],
+        per_message=False,
+    )
 
-    if not emp_id or not field:
+
+# ════════════════════════════════════════════════════════════════════
+#  СМЕНЫ
+# ════════════════════════════════════════════════════════════════════
+
+async def conv_shift_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    action = q.data.split(":")[1]   # mark | edit
+    context.user_data.clear()
+    context.user_data["shift_action"] = action
+
+    employees = [e for e in db.get_all_employees() if not e.get("is_replacement_for")]
+    if not employees:
+        await q.edit_message_text("Нет сотрудников.", reply_markup=kb_main())
         return ConversationHandler.END
 
-    value = update.message.text.strip()
-    db.update_employee(emp_id, {field: value})
+    await q.edit_message_text("Выберите сотрудника:",
+                               reply_markup=kb_employees_list(employees, "shsel"))
+    return SHIFT_SELECT_EMP
+
+async def conv_shift_emp(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    emp_id = int(q.data.split(":")[1])
     emp = db.get_employee(emp_id)
+    if not emp:
+        await q.edit_message_text("Сотрудник не найден.")
+        return ConversationHandler.END
 
-    await update.message.reply_text(
-        f"✅ *{emp['name']}* обновлён.\n\n"
-        "Не забудьте пересобрать таблицу через 📊 Таблица → Пересобрать.",
-        parse_mode="Markdown",
-        reply_markup=InlineKeyboardMarkup([[
-            InlineKeyboardButton("👥 К сотрудникам", callback_data="menu_employees")
-        ]])
+    context.user_data["shift_emp_id"] = emp_id
+    context.user_data["shift_emp_section"] = emp["section"]
+
+    t = today_tz()
+    await q.edit_message_text(
+        f"Сотрудник: <b>{emp['name']}</b>\nВыберите день {MONTH_NAMES_RU[t.month]} {t.year}:",
+        parse_mode="HTML",
+        reply_markup=kb_day_picker(t.year, t.month),
     )
-    user_data_store.pop(chat_id, None)
-    return ConversationHandler.END
+    return SHIFT_SELECT_DATE
 
+async def conv_shift_date(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    day = int(q.data.split(":")[1])
+    context.user_data["shift_day"] = day
 
-# ─── Увольнение ───────────────────────────────────────────────────────────────
+    section = context.user_data["shift_emp_section"]
+    t = today_tz()
 
-async def emp_fire_pick(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-
-    employees = [e for e in db.get_all_employees() if not e.get("fired")]
-    if not employees:
-        await query.edit_message_text(
-            "Нет активных сотрудников.",
-            reply_markup=InlineKeyboardMarkup([[
-                InlineKeyboardButton("◀️ Назад", callback_data="menu_employees")
-            ]])
+    if section == "runners":
+        await q.edit_message_text(
+            f"День {day}. Введите количество часов (например: 6, 8.5, 12):",
+            reply_markup=kb_cancel()
         )
-        return
-
-    keyboard = []
-    for emp in employees:
-        short = " ".join(emp["name"].split()[:2])
-        keyboard.append([InlineKeyboardButton(short, callback_data=f"emp_fire_{emp['id']}")])
-    keyboard.append([InlineKeyboardButton("◀️ Назад", callback_data="menu_employees")])
-
-    await query.edit_message_text(
-        "🔴 Выберите сотрудника для увольнения:",
-        reply_markup=InlineKeyboardMarkup(keyboard)
-    )
-
-
-async def emp_fire_select(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    chat_id = query.message.chat_id
-
-    emp_id = int(query.data.replace("emp_fire_", ""))
-    emp = db.get_employee(emp_id)
-    user_data_store[chat_id] = {"firing_emp": emp_id}
-
-    await query.edit_message_text(
-        f"🔴 Увольнение: *{emp['name']}*\n\nВведите дату увольнения (ДД.ММ.ГГГГ) или напишите 'сегодня':",
-        parse_mode="Markdown",
-        reply_markup=InlineKeyboardMarkup([[
-            InlineKeyboardButton("❌ Отмена", callback_data="menu_employees")
-        ]])
-    )
-    return FIRE_DATE
-
-
-async def emp_fire_date(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    text = update.message.text.strip().lower()
-
-    if text == "сегодня":
-        fired_date = now_tz().date().strftime("%d.%m.%Y")
+        return SHIFT_SELECT_VALUE
     else:
-        try:
-            d = datetime.strptime(text, "%d.%m.%Y")
-            fired_date = d.strftime("%d.%m.%Y")
-        except ValueError:
-            await update.message.reply_text("❌ Неверный формат. Введите ДД.ММ.ГГГГ или 'сегодня':")
-            return FIRE_DATE
+        await q.edit_message_text(
+            f"День {day}. Выберите значение смены:",
+            reply_markup=kb_shift_values(section)
+        )
+        return SHIFT_SELECT_VALUE
 
-    emp_id = user_data_store[chat_id]["firing_emp"]
-    emp = db.get_employee(emp_id)
-    db.update_employee(emp_id, {"fired": True, "fired_date": fired_date})
+async def conv_shift_value_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Выбор значения кнопкой (не раннеры)."""
+    q = update.callback_query
+    await q.answer()
+    value = q.data.split(":")[1]
+    context.user_data["shift_value"] = value
 
-    # Обновить в таблице
-    today = now_tz().date()
-    try:
-        sheets.mark_employee_fired(emp_id, fired_date, today.year, today.month)
-    except Exception as e:
-        logger.error(e)
-
-    await update.message.reply_text(
-        f"✅ *{emp['name']}* уволен с {fired_date}.",
-        parse_mode="Markdown",
-        reply_markup=InlineKeyboardMarkup([[
-            InlineKeyboardButton("👥 К сотрудникам", callback_data="menu_employees")
-        ]])
+    # Спросить о замене
+    emp = db.get_employee(context.user_data["shift_emp_id"])
+    await q.edit_message_text(
+        f"Это замена другого сотрудника вместо <b>{emp['name']}</b>?",
+        parse_mode="HTML",
+        reply_markup=kb_yes_no("rep:yes", "rep:no"),
     )
-    user_data_store.pop(chat_id, None)
+    return SHIFT_IS_REPLACE
+
+async def conv_shift_value_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Ввод часов текстом (раннеры)."""
+    raw = update.message.text.strip().replace(",", ".")
+    try:
+        hours = float(raw)
+    except ValueError:
+        await update.message.reply_text("Введите число (например 6 или 8.5):",
+                                        reply_markup=kb_cancel())
+        return SHIFT_SELECT_VALUE
+    context.user_data["shift_value"] = hours
+    # Раннеры — замены не бывает
+    return await _finish_shift(update.message, context)
+
+async def conv_shift_is_replace(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    answer = q.data.split(":")[1]   # yes | no
+
+    if answer == "no":
+        return await _finish_shift(q, context)
+
+    # Выбрать, за кого работает
+    employees = [e for e in db.get_all_employees() if not e.get("is_replacement_for")]
+    target_id = context.user_data["shift_emp_id"]
+    others = [e for e in employees if e["id"] != target_id]
+    if not others:
+        await q.edit_message_text("Нет других сотрудников для замены.")
+        return ConversationHandler.END
+
+    await q.edit_message_text("Замена за кого?",
+                               reply_markup=kb_employees_list(others, "repfor"))
+    return SHIFT_REPLACE_FOR
+
+async def conv_shift_replace_for(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    main_emp_id = int(q.data.split(":")[1])
+    context.user_data["shift_replace_for"] = main_emp_id
+    return await _finish_shift(q, context, is_replacement=True)
+
+async def _finish_shift(msg_or_query, context: ContextTypes.DEFAULT_TYPE,
+                         is_replacement: bool = False):
+    ud = context.user_data
+    emp_id   = ud["shift_emp_id"]
+    day      = ud["shift_day"]
+    value    = ud["shift_value"]
+    t        = today_tz()
+
+    emp = db.get_employee(emp_id)
+
+    if is_replacement:
+        main_emp_id = ud["shift_replace_for"]
+        # Убедимся что строка замены существует в БД и листе
+        existing = db.find_replacement_row(main_emp_id, emp["name"])
+        if existing:
+            replacer_id = existing["id"]
+        else:
+            # Создаём новую запись замены в БД
+            rep_data = {
+                "name":               emp["name"],
+                "phone":              emp.get("phone", ""),
+                "position":           emp.get("position", ""),
+                "section":            db.get_employee(main_emp_id)["section"],
+                "schedule":           "",
+                "is_replacement_for": main_emp_id,
+            }
+            new_rep = db.add_employee(rep_data)
+            replacer_id = new_rep["id"]
+            # Добавить строку в лист
+            sheets.add_replacement_row_to_sheet(main_emp_id, replacer_id, t.year, t.month)
+
+        ok = sheets.write_shift(replacer_id, day, value, t.year, t.month)
+        main_name = db.get_employee(main_emp_id)["name"]
+        result_text = (f"✅ Записано: {emp['name']} (замена за {main_name}) | "
+                       f"день {day} = {value}")
+    else:
+        ok = sheets.write_shift(emp_id, day, value, t.year, t.month)
+        result_text = f"✅ Записано: {emp['name']} | день {day} = {value}"
+
+    if not ok:
+        result_text = ("⚠️ Строка сотрудника не найдена в таблице. "
+                       "Сначала создайте таблицу через меню 📊.")
+
+    if hasattr(msg_or_query, "edit_message_text"):
+        await msg_or_query.edit_message_text(result_text)
+    else:
+        await msg_or_query.reply_text(result_text)
+
+    context.user_data.clear()
     return ConversationHandler.END
 
 
-# ─── Финансы ──────────────────────────────────────────────────────────────────
-
-async def menu_finance(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-
-    employees = [e for e in db.get_all_employees() if not e.get("fired") and not e.get("is_replacement_for")]
-    keyboard = []
-    for emp in employees:
-        short = " ".join(emp["name"].split()[:2])
-        keyboard.append([InlineKeyboardButton(short, callback_data=f"fin_emp_{emp['id']}")])
-    keyboard.append([InlineKeyboardButton("◀️ Назад", callback_data="back_main")])
-
-    await query.edit_message_text(
-        "💰 *Аванс / Удержание*\nВыберите сотрудника:",
-        parse_mode="Markdown",
-        reply_markup=InlineKeyboardMarkup(keyboard)
+def conv_shifts() -> ConversationHandler:
+    return ConversationHandler(
+        entry_points=[
+            CallbackQueryHandler(conv_shift_start, pattern="^shift:(mark|edit)$"),
+        ],
+        states={
+            SHIFT_SELECT_EMP: [
+                CallbackQueryHandler(conv_shift_emp, pattern="^shsel:"),
+            ],
+            SHIFT_SELECT_DATE: [
+                CallbackQueryHandler(conv_shift_date, pattern="^day:"),
+            ],
+            SHIFT_SELECT_VALUE: [
+                CallbackQueryHandler(conv_shift_value_cb,  pattern="^val:"),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, conv_shift_value_text),
+            ],
+            SHIFT_IS_REPLACE: [
+                CallbackQueryHandler(conv_shift_is_replace, pattern="^rep:"),
+            ],
+            SHIFT_REPLACE_FOR: [
+                CallbackQueryHandler(conv_shift_replace_for, pattern="^repfor:"),
+            ],
+        },
+        fallbacks=[
+            CommandHandler("cancel", cmd_cancel),
+            CallbackQueryHandler(cb_cancel, pattern="^cancel$"),
+        ],
+        per_message=False,
     )
 
 
-async def fin_emp_select(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    chat_id = query.message.chat_id
+# ════════════════════════════════════════════════════════════════════
+#  ФИНАНСЫ
+# ════════════════════════════════════════════════════════════════════
 
-    emp_id = int(query.data.replace("fin_emp_", ""))
-    emp = db.get_employee(emp_id)
-    user_data_store[chat_id] = {"fin_emp": emp_id}
+async def conv_fin_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    fin_type = q.data.split(":")[1]   # advance | deduction
+    context.user_data.clear()
+    context.user_data["fin_type"] = fin_type
 
-    keyboard = [
-        [InlineKeyboardButton("💳 Аванс",       callback_data="fin_type_advance")],
-        [InlineKeyboardButton("➖ Удержание",    callback_data="fin_type_deduction")],
-        [InlineKeyboardButton("◀️ Назад",        callback_data="menu_finance")],
-    ]
-    await query.edit_message_text(
-        f"💰 *{emp['name']}*\nВыберите тип:",
-        parse_mode="Markdown",
-        reply_markup=InlineKeyboardMarkup(keyboard)
-    )
+    employees = [e for e in db.get_all_employees() if not e.get("is_replacement_for")]
+    if not employees:
+        await q.edit_message_text("Нет сотрудников.", reply_markup=kb_main())
+        return ConversationHandler.END
 
-
-async def fin_type_select(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    chat_id = query.message.chat_id
-
-    fin_type = query.data.replace("fin_type_", "")
-    user_data_store[chat_id]["fin_type"] = fin_type
-    emp = db.get_employee(user_data_store[chat_id]["fin_emp"])
     label = "аванс" if fin_type == "advance" else "удержание"
+    await q.edit_message_text(f"💰 {label.capitalize()}. Выберите сотрудника:",
+                               reply_markup=kb_employees_list(employees, "finsel"))
+    return FIN_SELECT_EMP
 
-    await query.edit_message_text(
-        f"💰 *{emp['name']}* — {label}\n\nВведите сумму (или текст, например '1 футболка'):",
-        parse_mode="Markdown",
-        reply_markup=InlineKeyboardMarkup([[
-            InlineKeyboardButton("❌ Отмена", callback_data="menu_finance")
-        ]])
+async def conv_fin_emp(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    emp_id = int(q.data.split(":")[1])
+    context.user_data["fin_emp_id"] = emp_id
+    emp = db.get_employee(emp_id)
+    fin_type = context.user_data["fin_type"]
+    label = "аванс" if fin_type == "advance" else "удержание"
+    await q.edit_message_text(
+        f"Сотрудник: <b>{emp['name']}</b>\nВведите сумму ({label}):",
+        parse_mode="HTML",
+        reply_markup=kb_cancel()
     )
     return FIN_VALUE
 
-
-async def fin_value_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    state = user_data_store.get(chat_id, {})
-    emp_id = state.get("fin_emp")
-    fin_type = state.get("fin_type")
-
-    value = update.message.text.strip()
-    today = now_tz().date()
-
+async def conv_fin_value(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    raw = update.message.text.strip()
     try:
-        sheets.write_finance(emp_id, fin_type, value, today.year, today.month)
-        emp = db.get_employee(emp_id)
-        label = "аванс" if fin_type == "advance" else "удержание"
-        await update.message.reply_text(
-            f"✅ *{emp['name']}* — {label}: {value} сохранено.",
-            parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup([[
-                InlineKeyboardButton("◀️ В меню", callback_data="back_main")
-            ]])
-        )
-    except Exception as e:
-        await update.message.reply_text(f"❌ Ошибка: {e}")
+        amount = int(raw)
+    except ValueError:
+        await update.message.reply_text("Введите целое число (сумма в тенге):",
+                                        reply_markup=kb_cancel())
+        return FIN_VALUE
 
-    user_data_store.pop(chat_id, None)
+    emp_id   = context.user_data["fin_emp_id"]
+    fin_type = context.user_data["fin_type"]
+    emp      = db.get_employee(emp_id)
+    t        = today_tz()
+
+    ok = sheets.write_finance(emp_id, fin_type, amount, t.year, t.month)
+    label = "Аванс" if fin_type == "advance" else "Удержание"
+    if ok:
+        await update.message.reply_text(
+            f"✅ {label} для <b>{emp['name']}</b> = {amount} ₸",
+            parse_mode="HTML"
+        )
+    else:
+        await update.message.reply_text(
+            "⚠️ Строка не найдена. Сначала создайте таблицу."
+        )
+    context.user_data.clear()
     return ConversationHandler.END
 
 
-# ─── Меню таблицы ─────────────────────────────────────────────────────────────
-
-async def menu_table(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-
-    today = now_tz().date()
-    url = f"https://docs.google.com/spreadsheets/d/{config.SPREADSHEET_ID}"
-
-    keyboard = [
-        [InlineKeyboardButton("🔨 Создать/Пересобрать таблицу месяца",
-                              callback_data="table_rebuild")],
-        [InlineKeyboardButton("📥 Скачать .xlsx",
-                              callback_data="table_export")],
-        [InlineKeyboardButton("📊 Открыть Google Sheets", url=url)],
-        [InlineKeyboardButton("◀️ Назад", callback_data="back_main")],
-    ]
-    await query.edit_message_text(
-        f"📊 *Таблица*\nТекущий месяц: *{MONTH_NAMES_RU[today.month]} {today.year}*",
-        parse_mode="Markdown",
-        reply_markup=InlineKeyboardMarkup(keyboard)
+def conv_finance() -> ConversationHandler:
+    return ConversationHandler(
+        entry_points=[
+            CallbackQueryHandler(conv_fin_start, pattern="^fin:(advance|deduction)$"),
+        ],
+        states={
+            FIN_SELECT_EMP: [CallbackQueryHandler(conv_fin_emp, pattern="^finsel:")],
+            FIN_VALUE:      [MessageHandler(filters.TEXT & ~filters.COMMAND, conv_fin_value)],
+        },
+        fallbacks=[
+            CommandHandler("cancel", cmd_cancel),
+            CallbackQueryHandler(cb_cancel, pattern="^cancel$"),
+        ],
+        per_message=False,
     )
 
 
-async def table_rebuild(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    today = now_tz().date()
+# ════════════════════════════════════════════════════════════════════
+#  УВОЛЬНЕНИЕ
+# ════════════════════════════════════════════════════════════════════
 
-    await query.edit_message_text(
-        f"⏳ Пересобираю таблицу за {MONTH_NAMES_RU[today.month]} {today.year}...\n"
-        "Это может занять 10-20 секунд."
+async def conv_fire_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    context.user_data.clear()
+    employees = [e for e in db.get_all_employees()
+                 if not e.get("fired") and not e.get("is_replacement_for")]
+    if not employees:
+        await q.edit_message_text("Нет активных сотрудников.")
+        return ConversationHandler.END
+    await q.edit_message_text("Выберите сотрудника для увольнения:",
+                               reply_markup=kb_employees_list(employees, "firesel"))
+    return FIRE_SELECT_EMP
+
+async def conv_fire_emp(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    emp_id = int(q.data.split(":")[1])
+    context.user_data["fire_emp_id"] = emp_id
+    emp = db.get_employee(emp_id)
+    await q.edit_message_text(
+        f"Увольнение: <b>{emp['name']}</b>\nВведите дату увольнения (ДД.ММ.ГГГГ):",
+        parse_mode="HTML",
+        reply_markup=kb_cancel()
+    )
+    return FIRE_DATE
+
+async def conv_fire_date(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    raw = update.message.text.strip()
+    try:
+        datetime.strptime(raw, "%d.%m.%Y")
+    except ValueError:
+        await update.message.reply_text("Неверный формат. Введите ДД.ММ.ГГГГ:",
+                                        reply_markup=kb_cancel())
+        return FIRE_DATE
+
+    emp_id = context.user_data["fire_emp_id"]
+    emp    = db.get_employee(emp_id)
+    t      = today_tz()
+
+    db.update_employee(emp_id, {"fired": True, "fired_date": raw})
+    sheets.mark_employee_fired(emp_id, raw, t.year, t.month)
+
+    await update.message.reply_text(
+        f"🚫 <b>{emp['name']}</b> уволен с {raw}. Строка помечена в таблице.",
+        parse_mode="HTML"
+    )
+    context.user_data.clear()
+    return ConversationHandler.END
+
+
+def conv_fire_employee() -> ConversationHandler:
+    return ConversationHandler(
+        entry_points=[CallbackQueryHandler(conv_fire_start, pattern="^emp:fire$")],
+        states={
+            FIRE_SELECT_EMP: [CallbackQueryHandler(conv_fire_emp, pattern="^firesel:")],
+            FIRE_DATE:       [MessageHandler(filters.TEXT & ~filters.COMMAND, conv_fire_date)],
+        },
+        fallbacks=[
+            CommandHandler("cancel", cmd_cancel),
+            CallbackQueryHandler(cb_cancel, pattern="^cancel$"),
+        ],
+        per_message=False,
     )
 
+
+# ════════════════════════════════════════════════════════════════════
+#  УДАЛЕНИЕ СОТРУДНИКА
+# ════════════════════════════════════════════════════════════════════
+
+async def conv_delete_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    employees = db.get_all_employees()
+    if not employees:
+        await q.edit_message_text("Нет сотрудников.")
+        return ConversationHandler.END
+    await q.edit_message_text(
+        "⚠️ Выберите сотрудника для удаления из БД (строка в листе останется):",
+        reply_markup=kb_employees_list(employees, "delsel", skip_replacements=False)
+    )
+    return DELETE_SELECT_EMP
+
+async def conv_delete_emp(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    emp_id = int(q.data.split(":")[1])
+    emp = db.get_employee(emp_id)
+    name = emp["name"] if emp else str(emp_id)
+    db.delete_employee(emp_id)
+    await q.edit_message_text(f"🗑 Сотрудник <b>{name}</b> удалён из базы.",
+                               parse_mode="HTML")
+    return ConversationHandler.END
+
+
+def conv_delete_employee() -> ConversationHandler:
+    return ConversationHandler(
+        entry_points=[CallbackQueryHandler(conv_delete_start, pattern="^emp:delete$")],
+        states={
+            DELETE_SELECT_EMP: [CallbackQueryHandler(conv_delete_emp, pattern="^delsel:")],
+        },
+        fallbacks=[
+            CommandHandler("cancel", cmd_cancel),
+            CallbackQueryHandler(cb_cancel, pattern="^cancel$"),
+        ],
+        per_message=False,
+    )
+
+
+# ════════════════════════════════════════════════════════════════════
+#  ДОБАВЛЕНИЕ АДМИНИСТРАТОРА БОТА
+# ════════════════════════════════════════════════════════════════════
+
+async def conv_newadmin_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    await q.edit_message_text(
+        "Введите Telegram chat_id нового администратора бота:",
+        reply_markup=kb_cancel()
+    )
+    return NEW_ADMIN_ID
+
+async def conv_newadmin_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    raw = update.message.text.strip()
     try:
-        sheets.build_sheet(today.year, today.month)
-        url = f"https://docs.google.com/spreadsheets/d/{config.SPREADSHEET_ID}"
-        keyboard = [
-            [InlineKeyboardButton("📊 Открыть таблицу", url=url)],
-            [InlineKeyboardButton("◀️ Назад", callback_data="menu_table")],
-        ]
-        await query.edit_message_text(
-            f"✅ Таблица за {MONTH_NAMES_RU[today.month]} {today.year} создана!",
-            reply_markup=InlineKeyboardMarkup(keyboard)
+        new_id = int(raw)
+    except ValueError:
+        await update.message.reply_text("Введите числовой chat_id:", reply_markup=kb_cancel())
+        return NEW_ADMIN_ID
+    db.add_bot_admin(new_id)
+    await update.message.reply_text(f"✅ Администратор {new_id} добавлен.")
+    return ConversationHandler.END
+
+
+def conv_new_admin() -> ConversationHandler:
+    return ConversationHandler(
+        entry_points=[CallbackQueryHandler(conv_newadmin_start, pattern="^settings:add_admin$")],
+        states={
+            NEW_ADMIN_ID: [MessageHandler(filters.TEXT & ~filters.COMMAND, conv_newadmin_id)],
+        },
+        fallbacks=[
+            CommandHandler("cancel", cmd_cancel),
+            CallbackQueryHandler(cb_cancel, pattern="^cancel$"),
+        ],
+        per_message=False,
+    )
+
+
+# ════════════════════════════════════════════════════════════════════
+#  ТАБЛИЦА
+# ════════════════════════════════════════════════════════════════════
+
+async def cb_table_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    action = q.data.split(":")[1]   # build
+
+    if action == "build":
+        t = today_tz()
+        await q.edit_message_text(
+            f"⏳ Создаю/пересобираю таблицу за {month_label(t.year, t.month)}…"
         )
-    except Exception as e:
-        logger.error(e)
-        await query.edit_message_text(
-            f"❌ Ошибка при создании таблицы:\n`{e}`",
-            parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup([[
-                InlineKeyboardButton("◀️ Назад", callback_data="menu_table")
-            ]])
-        )
-
-
-async def table_export(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    chat_id = query.message.chat_id
-    today = now_tz().date()
-
-    await query.edit_message_text("⏳ Готовлю файл Excel...")
-
-    try:
-        filename = sheets.export_to_xlsx(today.year, today.month)
-        if filename and os.path.exists(filename):
-            with open(filename, "rb") as f:
-                await context.bot.send_document(
-                    chat_id=chat_id,
-                    document=f,
-                    filename=filename,
-                    caption=f"📊 Табель {MONTH_NAMES_RU[today.month]} {today.year}"
-                )
-            os.remove(filename)
-            await query.edit_message_text(
-                "✅ Файл отправлен.",
-                reply_markup=InlineKeyboardMarkup([[
-                    InlineKeyboardButton("◀️ Назад", callback_data="menu_table")
-                ]])
+        try:
+            ws, _ = sheets.build_sheet(t.year, t.month)
+            await q.edit_message_text(
+                f"✅ Таблица <b>{month_label(t.year, t.month)}</b> готова!\n"
+                f"Лист: «{ws.title}»",
+                parse_mode="HTML"
             )
+        except Exception as e:
+            logger.exception("build_sheet error")
+            await q.edit_message_text(f"❌ Ошибка: {e}")
+
+
+# ─── Скачать xlsx ─────────────────────────────────────────────────────────────
+
+async def _action_send_xlsx(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    t = today_tz()
+    try:
+        path = sheets.export_to_xlsx(t.year, t.month)
+        if path:
+            with open(path, "rb") as f:
+                await context.bot.send_document(
+                    chat_id=q.message.chat_id,
+                    document=f,
+                    filename=os.path.basename(path),
+                    caption=f"📁 Табель {month_label(t.year, t.month)}"
+                )
+            os.remove(path)
         else:
-            raise Exception("Файл не создан")
+            await q.edit_message_text("❌ Лист не найден. Сначала создайте таблицу.")
     except Exception as e:
-        logger.error(e)
-        await query.edit_message_text(
-            f"❌ Ошибка экспорта: {e}",
-            reply_markup=InlineKeyboardMarkup([[
-                InlineKeyboardButton("◀️ Назад", callback_data="menu_table")
-            ]])
-        )
+        logger.exception("export_to_xlsx error")
+        await q.edit_message_text(f"❌ Ошибка экспорта: {e}")
 
 
 # ─── Настройки ────────────────────────────────────────────────────────────────
 
-async def menu_settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-
+async def _action_settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
     admins = db.get_bot_admins()
-    admin_list = "\n".join([f"  • {a}" for a in admins]) if admins else "  нет дополнительных"
-
-    keyboard = [
-        [InlineKeyboardButton("➕ Добавить администратора бота", callback_data="settings_add_admin")],
-        [InlineKeyboardButton("➖ Удалить администратора",       callback_data="settings_del_admin")],
-        [InlineKeyboardButton("◀️ Назад", callback_data="back_main")],
-    ]
-    await query.edit_message_text(
-        f"⚙️ *Настройки*\n\nДоп. администраторы бота:\n{admin_list}",
-        parse_mode="Markdown",
-        reply_markup=InlineKeyboardMarkup(keyboard)
-    )
+    text = f"⚙️ Настройки\n\nТекущие администраторы: {admins or '(только владелец)'}"
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("➕ Добавить администратора", callback_data="settings:add_admin")],
+        [InlineKeyboardButton("❌ Закрыть", callback_data="cancel")],
+    ])
+    await q.edit_message_text(text, reply_markup=kb)
 
 
-async def settings_add_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    chat_id = query.message.chat_id
-    user_data_store[chat_id] = {"awaiting": "new_admin_id"}
+# ════════════════════════════════════════════════════════════════════
+#  НАПОМИНАНИЯ и АВТО-СОЗДАНИЕ ЛИСТА
+# ════════════════════════════════════════════════════════════════════
 
-    await query.edit_message_text(
-        "👤 Введите Telegram ID нового администратора:\n\n"
-        "_Пользователь может узнать свой ID через @userinfobot_",
-        parse_mode="Markdown",
-        reply_markup=InlineKeyboardMarkup([[
-            InlineKeyboardButton("❌ Отмена", callback_data="menu_settings")
-        ]])
-    )
-    return NEW_ADMIN_ID
-
-
-async def settings_new_admin_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    text = update.message.text.strip()
-    try:
-        new_id = int(text)
-        db.add_bot_admin(new_id)
-        await update.message.reply_text(
-            f"✅ Администратор {new_id} добавлен.",
-            reply_markup=InlineKeyboardMarkup([[
-                InlineKeyboardButton("◀️ Настройки", callback_data="menu_settings")
-            ]])
-        )
-    except ValueError:
-        await update.message.reply_text("❌ Введите числовой Telegram ID:")
-        return NEW_ADMIN_ID
-
-    user_data_store.pop(chat_id, None)
-    return ConversationHandler.END
-
-
-async def settings_del_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-
-    admins = db.get_bot_admins()
-    if not admins:
-        await query.answer("Нет дополнительных администраторов.", show_alert=True)
-        return
-
-    keyboard = []
-    for a in admins:
-        keyboard.append([InlineKeyboardButton(str(a), callback_data=f"del_admin_{a}")])
-    keyboard.append([InlineKeyboardButton("◀️ Назад", callback_data="menu_settings")])
-
-    await query.edit_message_text(
-        "Выберите администратора для удаления:",
-        reply_markup=InlineKeyboardMarkup(keyboard)
-    )
-
-
-async def del_admin_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    admin_id = int(query.data.replace("del_admin_", ""))
-    db.remove_bot_admin(admin_id)
-    await query.edit_message_text(
-        f"✅ Администратор {admin_id} удалён.",
-        reply_markup=InlineKeyboardMarkup([[
-            InlineKeyboardButton("◀️ Настройки", callback_data="menu_settings")
-        ]])
-    )
-
-
-# ─── Напоминания (jobs) ───────────────────────────────────────────────────────
-
-async def send_reminder(context: ContextTypes.DEFAULT_TYPE):
-    """Отправить напоминание об отметке смен."""
-    today = now_tz().date()
-    admins = [ADMIN_CHAT_ID] + db.get_bot_admins()
-
-    keyboard = InlineKeyboardMarkup([[
-        InlineKeyboardButton(
-            "✅ Отметить смены",
-            callback_data=f"shift_date_{today.isoformat()}"
-        )
-    ]])
-
-    text = (
-        f"⏰ *Напоминание*\n"
-        f"📅 {today.strftime('%d.%m.%Y')} — не забудьте отметить смены!"
-    )
-
-    for admin_id in admins:
+async def _send_reminder(bot, text: str):
+    targets = [ADMIN_CHAT_ID] + db.get_bot_admins()
+    for chat_id in targets:
         try:
-            await context.bot.send_message(
-                chat_id=admin_id,
-                text=text,
-                parse_mode="Markdown",
-                reply_markup=keyboard
-            )
-        except Exception as e:
-            logger.warning(f"Не удалось отправить напоминание {admin_id}: {e}")
+            await bot.send_message(chat_id=chat_id, text=text)
+        except Exception:
+            pass
 
+async def morning_reminder(bot):
+    t = today_tz()
+    await _send_reminder(bot, f"☀️ Доброе утро! Не забудьте отметить утренние смены за {t.day} {MONTH_NAMES_RU[t.month]}.")
 
-async def monthly_create_sheet(context: ContextTypes.DEFAULT_TYPE):
-    """1-го числа каждого месяца создать новый лист."""
-    today = now_tz().date()
-    if today.day != 1:
-        return
+async def evening_reminder(bot):
+    t = today_tz()
+    await _send_reminder(bot, f"🌙 Добрый вечер! Не забудьте отметить вечерние смены за {t.day} {MONTH_NAMES_RU[t.month]}.")
+
+async def auto_create_sheet(bot):
+    t = today_tz()
     try:
-        sheets.build_sheet(today.year, today.month)
-        admins = [ADMIN_CHAT_ID] + db.get_bot_admins()
-        for admin_id in admins:
-            await context.bot.send_message(
-                chat_id=admin_id,
-                text=f"📋 Автоматически создан табель за *{MONTH_NAMES_RU[today.month]} {today.year}*",
-                parse_mode="Markdown"
-            )
+        sheets.build_sheet(t.year, t.month)
+        await _send_reminder(bot, f"📊 Автоматически создан новый лист табеля: {month_label(t.year, t.month)}")
     except Exception as e:
-        logger.error(f"monthly_create_sheet error: {e}")
+        logger.exception("auto_create_sheet error")
+        await _send_reminder(bot, f"❌ Ошибка авто-создания листа: {e}")
 
 
-# ─── Запуск бота ──────────────────────────────────────────────────────────────
+# ════════════════════════════════════════════════════════════════════
+#  СБОРКА ПРИЛОЖЕНИЯ
+# ════════════════════════════════════════════════════════════════════
 
-async def noop_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.callback_query.answer()
+def setup_handlers(app: Application):
+    # Конверсейшн-хэндлеры (важен порядок — специфичные раньше общих)
+    app.add_handler(conv_add_employee())
+    app.add_handler(conv_edit_employee())
+    app.add_handler(conv_shifts())
+    app.add_handler(conv_finance())
+    app.add_handler(conv_fire_employee())
+    app.add_handler(conv_delete_employee())
+    app.add_handler(conv_new_admin())
+
+    # Команды
+    app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("menu",  cmd_start))
+    app.add_handler(CommandHandler("cancel", cmd_cancel))
+
+    # Навигация по главному меню
+    app.add_handler(CallbackQueryHandler(cb_main_menu, pattern="^menu:"))
+
+    # Список сотрудников
+    app.add_handler(CallbackQueryHandler(cb_emp_list, pattern="^emp:list$"))
+
+    # Таблица
+    app.add_handler(CallbackQueryHandler(cb_table_action, pattern="^table:"))
+
+    # Отмена вне конверсейшнов
+    app.add_handler(CallbackQueryHandler(cb_cancel, pattern="^cancel$"))
 
 
-async def back_main_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    await back_to_main(query)
+# ════════════════════════════════════════════════════════════════════
+#  FastAPI + lifespan
+# ════════════════════════════════════════════════════════════════════
+
+ptb_app: Application = None   # type: ignore
+scheduler: AsyncIOScheduler = None  # type: ignore
 
 
-async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    user_data_store.pop(chat_id, None)
-    await update.message.reply_text(
-        "❌ Отменено. Главное меню:",
-        reply_markup=main_menu_keyboard()
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global ptb_app, scheduler
+
+    ptb_app = Application.builder().token(BOT_TOKEN).build()
+    setup_handlers(ptb_app)
+    await ptb_app.initialize()
+
+    if WEBHOOK_URL:
+        await ptb_app.bot.set_webhook(
+            url=f"{WEBHOOK_URL}/webhook",
+            allowed_updates=Update.ALL_TYPES,
+        )
+        logger.info(f"Webhook set: {WEBHOOK_URL}/webhook")
+    else:
+        logger.warning("WEBHOOK_URL не задан — бот не получит обновления!")
+
+    await ptb_app.start()
+
+    # APScheduler
+    scheduler = AsyncIOScheduler(timezone=TZ)
+    scheduler.add_job(
+        morning_reminder, "cron",
+        hour=config.REMINDER_MORNING[0], minute=config.REMINDER_MORNING[1],
+        kwargs={"bot": ptb_app.bot},
     )
-    return ConversationHandler.END
-
-
-def main():
-    app = Application.builder().token(BOT_TOKEN).build()
-
-    # ConversationHandler: добавление сотрудника
-    add_emp_conv = ConversationHandler(
-        entry_points=[CallbackQueryHandler(emp_add_start, pattern="^emp_add$")],
-        states={
-            ADD_NAME:      [MessageHandler(filters.TEXT & ~filters.COMMAND, emp_add_name)],
-            ADD_PHONE:     [MessageHandler(filters.TEXT & ~filters.COMMAND, emp_add_phone)],
-            ADD_POSITION:  [MessageHandler(filters.TEXT & ~filters.COMMAND, emp_add_position)],
-            ADD_SECTION:   [CallbackQueryHandler(emp_add_section, pattern="^emp_section_")],
-            ADD_SCHEDULE:  [CallbackQueryHandler(emp_add_schedule, pattern="^emp_sched_")],
-            ADD_DAYS_OFF:  [CallbackQueryHandler(emp_add_days_off, pattern="^emp_doff_")],
-            ADD_START_DATE:[MessageHandler(filters.TEXT & ~filters.COMMAND, emp_add_start_date)],
-        },
-        fallbacks=[CallbackQueryHandler(menu_employees, pattern="^menu_employees$")],
-        per_message=False,
+    scheduler.add_job(
+        evening_reminder, "cron",
+        hour=config.REMINDER_EVENING[0], minute=config.REMINDER_EVENING[1],
+        kwargs={"bot": ptb_app.bot},
     )
-
-    # ConversationHandler: увольнение
-    fire_conv = ConversationHandler(
-        entry_points=[CallbackQueryHandler(emp_fire_select, pattern="^emp_fire_\\d+$")],
-        states={
-            FIRE_DATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, emp_fire_date)],
-        },
-        fallbacks=[CallbackQueryHandler(menu_employees, pattern="^menu_employees$")],
-        per_message=False,
+    scheduler.add_job(
+        auto_create_sheet, "cron",
+        day=1, hour=0, minute=5,
+        kwargs={"bot": ptb_app.bot},
     )
+    scheduler.start()
+    logger.info("APScheduler started")
 
-    # ConversationHandler: финансы
-    fin_conv = ConversationHandler(
-        entry_points=[CallbackQueryHandler(fin_type_select, pattern="^fin_type_")],
-        states={
-            FIN_VALUE: [MessageHandler(filters.TEXT & ~filters.COMMAND, fin_value_input)],
-        },
-        fallbacks=[CallbackQueryHandler(menu_finance, pattern="^menu_finance$")],
-        per_message=False,
-    )
+    yield
 
-    # ConversationHandler: редактирование сотрудника
-    edit_emp_conv = ConversationHandler(
-        entry_points=[CallbackQueryHandler(emp_edit_field, pattern="^emp_editf_")],
-        states={
-            EDIT_VALUE: [MessageHandler(filters.TEXT & ~filters.COMMAND, emp_edit_value)],
-        },
-        fallbacks=[CallbackQueryHandler(menu_employees, pattern="^menu_employees$")],
-        per_message=False,
-    )
-
-    # ConversationHandler: добавление администратора
-    admin_conv = ConversationHandler(
-        entry_points=[CallbackQueryHandler(settings_add_admin, pattern="^settings_add_admin$")],
-        states={
-            NEW_ADMIN_ID: [MessageHandler(filters.TEXT & ~filters.COMMAND, settings_new_admin_input)],
-        },
-        fallbacks=[CallbackQueryHandler(menu_settings, pattern="^menu_settings$")],
-        per_message=False,
-    )
-
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("cancel", cancel))
-    app.add_handler(add_emp_conv)
-    app.add_handler(fire_conv)
-    app.add_handler(fin_conv)
-    app.add_handler(edit_emp_conv)
-    app.add_handler(admin_conv)
-
-    # Callback handlers
-    app.add_handler(CallbackQueryHandler(back_main_callback,        pattern="^back_main$"))
-    app.add_handler(CallbackQueryHandler(menu_shift,                pattern="^menu_shift$"))
-    app.add_handler(CallbackQueryHandler(menu_employees,            pattern="^menu_employees$"))
-    app.add_handler(CallbackQueryHandler(emp_list,                  pattern="^emp_list$"))
-    app.add_handler(CallbackQueryHandler(emp_edit_pick,             pattern="^emp_edit_pick$"))
-    app.add_handler(CallbackQueryHandler(emp_edit_select,           pattern="^emp_edit_\\d+$"))
-    app.add_handler(CallbackQueryHandler(emp_fire_pick,             pattern="^emp_fire_pick$"))
-    app.add_handler(CallbackQueryHandler(menu_finance,              pattern="^menu_finance$"))
-    app.add_handler(CallbackQueryHandler(fin_emp_select,            pattern="^fin_emp_\\d+$"))
-    app.add_handler(CallbackQueryHandler(menu_table,                pattern="^menu_table$"))
-    app.add_handler(CallbackQueryHandler(table_rebuild,             pattern="^table_rebuild$"))
-    app.add_handler(CallbackQueryHandler(table_export,              pattern="^table_export$"))
-    app.add_handler(CallbackQueryHandler(menu_settings,             pattern="^menu_settings$"))
-    app.add_handler(CallbackQueryHandler(settings_del_admin,        pattern="^settings_del_admin$"))
-    app.add_handler(CallbackQueryHandler(del_admin_confirm,         pattern="^del_admin_\\d+$"))
-    app.add_handler(CallbackQueryHandler(shift_pick_month,          pattern="^shift_pick_month$"))
-    app.add_handler(CallbackQueryHandler(shift_select_date,         pattern="^shift_date_"))
-    app.add_handler(CallbackQueryHandler(shift_select_employee,     pattern="^shift_emp_"))
-    app.add_handler(CallbackQueryHandler(shift_set_value,           pattern="^shift_set_"))
-    app.add_handler(CallbackQueryHandler(shift_is_replace,          pattern="^shift_is_replace_"))
-    app.add_handler(CallbackQueryHandler(shift_replace_for,         pattern="^shift_replace_for_"))
-    app.add_handler(CallbackQueryHandler(noop_callback,             pattern="^noop$"))
-
-    # Текстовые сообщения (для ConversationHandler не перехваченные)
-    app.add_handler(MessageHandler(
-        filters.TEXT & ~filters.COMMAND, handle_runner_hours
-    ))
-
-    # Jobs — напоминания
-    job_queue = app.job_queue
-    tz = ZoneInfo(TIMEZONE)
-    job_queue.run_daily(send_reminder,
-                        time=datetime.now(tz).replace(
-                            hour=config.REMINDER_MORNING[0],
-                            minute=config.REMINDER_MORNING[1],
-                            second=0, microsecond=0
-                        ).timetz())
-    job_queue.run_daily(send_reminder,
-                        time=datetime.now(tz).replace(
-                            hour=config.REMINDER_EVENING[0],
-                            minute=config.REMINDER_EVENING[1],
-                            second=0, microsecond=0
-                        ).timetz())
-    # Автосоздание листа каждый день в 00:05 (проверяет: 1-е ли число)
-    job_queue.run_daily(monthly_create_sheet,
-                        time=datetime.now(tz).replace(
-                            hour=0, minute=5, second=0, microsecond=0
-                        ).timetz())
-
-    logger.info("✅ Табель-бот запущен!")
-    app.run_polling(drop_pending_updates=True)
+    scheduler.shutdown()
+    await ptb_app.stop()
+    await ptb_app.shutdown()
 
 
-if __name__ == "__main__":
-    main()
+fast_app = FastAPI(lifespan=lifespan)
+
+
+@fast_app.post("/webhook")
+async def webhook(request: Request):
+    data = await request.json()
+    update = Update.de_json(data, ptb_app.bot)
+    await ptb_app.process_update(update)
+    return {"ok": True}
+
+
+@fast_app.get("/")
+async def health():
+    return {"status": "ok", "bot": "tabel-bot"}

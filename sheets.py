@@ -1,29 +1,28 @@
 """
 Google Sheets: создание и обновление табеля.
-Структура листа точно повторяет шаблон из примера.
+Структура листа повторяет шаблон Н8.
 """
 import json
 import os
 import calendar
-from datetime import date, datetime
+import requests
+from datetime import date
 from typing import Optional
 
 import gspread
 from google.oauth2.service_account import Credentials
 import google.auth.transport.requests
 
-from config import (SPREADSHEET_ID, GOOGLE_CREDS_JSON, MONTH_NAMES_RU,
-                    WEEKDAYS_RU, SECTION_LABELS, SECTIONS)
-from database import get_all_employees, get_employees_by_section
+from config import (
+    SPREADSHEET_ID, GOOGLE_CREDS_JSON, MONTH_NAMES_RU,
+    SECTION_LABELS, SECTION_SHEET_HEADER, SECTIONS,
+)
+from database import get_all_employees
 from schedule import calc_plan_shifts, weekday_name_ru, days_in_month
 
-# Кэш подключения
-_gc = None
-_spreadsheet = None
-
+# ─── Подключение ──────────────────────────────────────────────────────────────
 
 def _get_spreadsheet():
-    global _gc, _spreadsheet
     scopes = [
         "https://spreadsheets.google.com/feeds",
         "https://www.googleapis.com/auth/drive",
@@ -33,25 +32,24 @@ def _get_spreadsheet():
     else:
         info = json.loads(GOOGLE_CREDS_JSON)
         creds = Credentials.from_service_account_info(info, scopes=scopes)
-
-    _gc = gspread.authorize(creds)
-    _spreadsheet = _gc.open_by_key(SPREADSHEET_ID)
-    return _spreadsheet
+    gc = gspread.authorize(creds)
+    return gc.open_by_key(SPREADSHEET_ID)
 
 
 def get_or_create_sheet(year: int, month: int):
-    """Получить или создать лист для данного месяца."""
     sheet_name = f"{MONTH_NAMES_RU[month]} {year}"
     sp = _get_spreadsheet()
     try:
         return sp.worksheet(sheet_name)
     except gspread.WorksheetNotFound:
-        ws = sp.add_worksheet(title=sheet_name, rows=200, cols=40)
+        ws = sp.add_worksheet(title=sheet_name, rows=300, cols=45)
         return ws
 
 
+# ─── Колонки ──────────────────────────────────────────────────────────────────
+
 def col_letter(n: int) -> str:
-    """Индекс колонки (1-based) → буква(ы). 1=A, 7=G, 33=AG"""
+    """1-based индекс → буква(ы). 1=A, 27=AA, …"""
     result = ""
     while n > 0:
         n, r = divmod(n - 1, 26)
@@ -59,77 +57,83 @@ def col_letter(n: int) -> str:
     return result
 
 
+# Структура колонок:
+# 1=A  ФИО
+# 2=B  Номер
+# 3=C  Должность
+# 4=D  График
+# 5=E  Кол-во раб.дн (план)  / пусто для раннеров
+# 6=F  Кол-во отр.дн (факт) = SUM  / Кол-во отр.часов для раннеров
+# 7=G  День 1
+# …
+# 6+total_days = последний день
+# 6+total_days+1 = Удержание
+# 6+total_days+2 = Аванс
+
 def day_col(day: int) -> str:
-    """День месяца → буква колонки. День 1 = колонка G (7)."""
     return col_letter(6 + day)
+
+def deduction_col(total_days: int) -> str:
+    return col_letter(6 + total_days + 1)
+
+def advance_col(total_days: int) -> str:
+    return col_letter(6 + total_days + 2)
 
 
 # ─── Построение табеля ────────────────────────────────────────────────────────
 
-# Структура листа:
-# Строка 1: заголовок "Н8" (или название)
-# Строка 2-3: пусто
-# Для каждого раздела:
-#   - строка "Подразделение: ..."  (кроме первого раздела)
-#   - строка заголовков (ФИО, Номер, ...)
-#   - строка дней недели
-#   - строки сотрудников
-#   - итоговая строка
-#   - пустая строка-разделитель
-
 def build_sheet(year: int, month: int):
-    """Полностью пересобрать лист табеля (вызывается при создании месяца)."""
+    """
+    Полностью пересобрать лист табеля.
+    Возвращает (worksheet, row_map).
+    row_map = {emp_id: row_number}  для всех строк (включая замены).
+    """
     ws = get_or_create_sheet(year, month)
-    employees = get_all_employees()
-    total_days = days_in_month(year, month)
-    sheet_name = f"{MONTH_NAMES_RU[month]} {year}"
-
-    # Очищаем лист
     ws.clear()
 
-    # Форматирование
-    all_data = []   # список строк для batch update
+    employees = get_all_employees()
+    total_days = days_in_month(year, month)
+    n_cols = 6 + total_days + 2  # A…Аванс
 
+    all_data = []     # строки для batch update
+    row_map = {}      # emp_id → номер строки (1-based)
     current_row = 1
 
-    # Заголовок таблицы
-    header_row = [""] * (6 + total_days + 2)
-    header_row[9] = sheet_name
-    all_data.append(header_row)
-    current_row += 1
+    # ── Заголовок листа ──
+    title_row = [""] * n_cols
+    title_row[9] = f"{MONTH_NAMES_RU[month]} {year}"
+    all_data.append(title_row)
+    all_data.append([""] * n_cols)
+    all_data.append([""] * n_cols)
+    current_row += 3
 
-    # Пустые строки
-    all_data.append([""] * (6 + total_days + 2))
-    all_data.append([""] * (6 + total_days + 2))
-    current_row += 2
-
-    # Хранит {section: {emp_id: row_number}} для последующих обновлений
-    row_map = {}
-
+    # ── Секции ──
     for section in SECTIONS:
-        section_employees = [e for e in employees if e["section"] == section]
-        if not section_employees and section != "admins":
+        # Основные сотрудники раздела (не строки-замены)
+        sec_emps = [
+            e for e in employees
+            if e["section"] == section and not e.get("is_replacement_for")
+        ]
+        # Пропускаем пустые разделы (кроме первого — чтобы шапка всегда была)
+        if not sec_emps and section != SECTIONS[0]:
             continue
 
-        row_map[section] = {}
+        # Заголовок раздела
+        header_text = SECTION_SHEET_HEADER[section]
+        if header_text:
+            h_row = [""] * n_cols
+            h_row[5] = header_text
+            all_data.append(h_row)
+            all_data.append([""] * n_cols)
+            current_row += 2
 
-        # Подзаголовок раздела (кроме первого)
-        if section != SECTIONS[0]:
-            sub_row = [""] * (6 + total_days + 2)
-            sub_row[5] = f"Подразделение: {SECTION_LABELS[section]}"
-            all_data.append(sub_row)
-            current_row += 1
-            # пустая
-            all_data.append([""] * (6 + total_days + 2))
-            current_row += 1
-
-        # Строка заголовков колонок
+        # Строка названий колонок
         if section == "runners":
             col_headers = ["Ф.И.О.", "Номер", "Должность", "", "", "Кол-во отр.часов"]
         else:
             col_headers = ["Ф.И.О.", "Номер", "Должность", "график",
                            "Кол-во раб.дн", "Кол-во отр.дн"]
-        col_headers += list(range(1, total_days + 1)) + ["удержание", "аванс"]
+        col_headers += list(range(1, total_days + 1)) + ["Удержание", "Аванс"]
         all_data.append(col_headers)
         current_row += 1
 
@@ -141,236 +145,252 @@ def build_sheet(year: int, month: int):
         all_data.append(dow_row)
         current_row += 1
 
-        # Строки сотрудников
+        # ── Строки сотрудников ──
         emp_start_row = current_row
-        emp_rows = []  # (emp_id, row_number)
 
-        for emp in section_employees:
-            plan = calc_plan_shifts(emp, year, month) if section != "runners" else None
-            fired_str = ""
-            if emp.get("fired"):
-                fired_str = f"Уволен с {emp.get('fired_date', '')}"
-
-            if section == "runners":
-                emp_row = [
-                    emp["name"],
-                    emp.get("phone", ""),
-                    emp.get("position", "Раннер"),
-                    "", "", ""
-                ]
-            else:
-                emp_row = [
-                    emp["name"],
-                    emp.get("phone", ""),
-                    emp.get("position", ""),
-                    emp.get("schedule", ""),
-                    plan if plan is not None else "",
-                    f"=SUM({day_col(1)}{current_row}:{day_col(total_days)}{current_row})"
-                ]
-
-            # Ячейки дней — нули
-            emp_row += [0] * total_days
-
-            # Удержание и аванс
-            emp_row += [fired_str or "", ""]
-
+        for emp in sec_emps:
+            emp_row = _build_emp_row(emp, section, current_row, year, month, total_days)
             all_data.append(emp_row)
-            row_map[section][emp["id"]] = current_row
-            emp_rows.append((emp["id"], current_row))
+            row_map[emp["id"]] = current_row
             current_row += 1
 
-        # Итоговая строка раздела
-        total_row = ["", "", "", ""]
-        if section == "runners":
-            sum_col = f"=SUM({day_col(1)}{emp_start_row}:{day_col(total_days)}{current_row - 1})"
-            total_row = ["", "", "", "", "", sum_col]
-        else:
-            plan_sum = f"=SUM(E{emp_start_row}:E{current_row - 1})"
-            fact_sum = f"=SUM(F{emp_start_row}:F{current_row - 1})"
-            total_row = ["", "", "", "", plan_sum, fact_sum]
+            # Строки замен для этого сотрудника
+            replacements = [
+                e for e in employees
+                if e.get("is_replacement_for") == emp["id"]
+            ]
+            for rep in replacements:
+                rep_row = _build_replacement_row(rep, emp, current_row, total_days)
+                all_data.append(rep_row)
+                row_map[rep["id"]] = current_row
+                current_row += 1
 
-        for d in range(1, total_days + 1):
-            col = day_col(d)
-            total_row.append(f"=SUM({col}{emp_start_row}:{col}{current_row - 1})")
-        total_row += ["", ""]
+        # Итоговая строка раздела
+        total_row = _build_total_row(section, emp_start_row, current_row - 1,
+                                     total_days, n_cols)
         all_data.append(total_row)
         current_row += 1
 
         # Разделитель
-        all_data.append([""] * (6 + total_days + 2))
+        all_data.append([""] * n_cols)
         current_row += 1
 
-    # Записываем всё одним запросом
+    # ── Запись ──
     ws.update("A1", all_data, value_input_option="USER_ENTERED")
 
-    # Сохраняем маппинг строк в настройки
     _save_row_map(year, month, row_map)
-
     return ws, row_map
 
 
-def _row_map_key(year: int, month: int) -> str:
-    return f"row_map_{year}_{month}"
+def _build_emp_row(emp: dict, section: str, row: int,
+                   year: int, month: int, total_days: int) -> list:
+    plan = None if section == "runners" else calc_plan_shifts(emp, year, month)
+
+    fired_str = ""
+    if emp.get("fired"):
+        fired_str = f"Уволен с {emp.get('fired_date', '')}"
+
+    if section == "runners":
+        base = [emp["name"], emp.get("phone", ""), emp.get("position", "Раннер"), "", "",
+                f"=SUM({day_col(1)}{row}:{day_col(total_days)}{row})"]
+    else:
+        fact_formula = f"=SUM({day_col(1)}{row}:{day_col(total_days)}{row})"
+        base = [
+            emp["name"],
+            emp.get("phone", ""),
+            emp.get("position", ""),
+            emp.get("schedule", ""),
+            plan if plan is not None else "",
+            fact_formula,
+        ]
+
+    base += [0] * total_days
+    base += [fired_str or "", ""]
+    return base
+
+
+def _build_replacement_row(rep: dict, main_emp: dict, row: int, total_days: int) -> list:
+    label = f"замена за {main_emp['name']}"
+    base = [
+        rep["name"],
+        rep.get("phone", ""),
+        rep.get("position", main_emp.get("position", "")),
+        "",
+        "",
+        f"=SUM({day_col(1)}{row}:{day_col(total_days)}{row})",
+    ]
+    base += [0] * total_days
+    base += ["", ""]
+    # Имя сотрудника с пометкой «замена»
+    base[0] = f"{rep['name']} ({label})"
+    return base
+
+
+def _build_total_row(section: str, start_row: int, end_row: int,
+                     total_days: int, n_cols: int) -> list:
+    total_row = [""] * n_cols
+    if section == "runners":
+        total_row[5] = f"=SUM(F{start_row}:F{end_row})"
+    else:
+        total_row[4] = f"=SUM(E{start_row}:E{end_row})"
+        total_row[5] = f"=SUM(F{start_row}:F{end_row})"
+    for d in range(1, total_days + 1):
+        col = day_col(d)
+        total_row[5 + d] = f"=SUM({col}{start_row}:{col}{end_row})"
+    return total_row
+
+
+# ─── row_map кэш ──────────────────────────────────────────────────────────────
+
+def _row_map_file(year: int, month: int) -> str:
+    return f".row_map_{year}_{month:02d}.json"
 
 
 def _save_row_map(year: int, month: int, row_map: dict):
-    """Сохранить маппинг {section: {emp_id: row}} в файл."""
-    import json
-    key = _row_map_key(year, month)
-    cache_file = f".{key}.json"
-    with open(cache_file, "w") as f:
+    with open(_row_map_file(year, month), "w", encoding="utf-8") as f:
         json.dump(row_map, f)
 
 
 def _load_row_map(year: int, month: int) -> dict:
-    import json
-    key = _row_map_key(year, month)
-    cache_file = f".{key}.json"
-    if os.path.exists(cache_file):
-        with open(cache_file, "r") as f:
+    path = _row_map_file(year, month)
+    if os.path.exists(path):
+        with open(path, "r", encoding="utf-8") as f:
             return json.load(f)
     return {}
 
 
 def get_employee_row(emp_id: int, year: int, month: int) -> Optional[int]:
-    """Получить номер строки сотрудника в листе."""
-    row_map = _load_row_map(year, month)
-    for section_map in row_map.values():
-        # ключи в JSON всегда строки
-        if str(emp_id) in section_map:
-            return section_map[str(emp_id)]
-    return None
+    rm = _load_row_map(year, month)
+    val = rm.get(str(emp_id)) or rm.get(emp_id)
+    return val
 
 
 # ─── Запись значений ──────────────────────────────────────────────────────────
 
-def write_shift(emp_id: int, day: int, value, year: int, month: int):
-    """Записать значение смены в ячейку."""
+def write_shift(emp_id: int, day: int, value, year: int, month: int) -> bool:
     row = get_employee_row(emp_id, year, month)
     if row is None:
         return False
     ws = get_or_create_sheet(year, month)
-    cell = f"{day_col(day)}{row}"
-    ws.update(cell, [[value]], value_input_option="USER_ENTERED")
+    ws.update(f"{day_col(day)}{row}", [[value]], value_input_option="USER_ENTERED")
     return True
 
 
-def write_finance(emp_id: int, field: str, value, year: int, month: int):
-    """
-    Записать удержание или аванс.
-    field = 'deduction' | 'advance'
-    """
+def write_finance(emp_id: int, field: str, value, year: int, month: int) -> bool:
+    """field = 'deduction' | 'advance'"""
     row = get_employee_row(emp_id, year, month)
     if row is None:
         return False
     ws = get_or_create_sheet(year, month)
     total_days = days_in_month(year, month)
-    # удержание = колонка после последнего дня, аванс = +1
-    if field == "deduction":
-        col = col_letter(6 + total_days + 1)
-    else:
-        col = col_letter(6 + total_days + 2)
+    col = deduction_col(total_days) if field == "deduction" else advance_col(total_days)
     ws.update(f"{col}{row}", [[value]], value_input_option="USER_ENTERED")
     return True
 
 
-def read_day_values(year: int, month: int, day: int) -> dict:
-    """Прочитать все значения за день. Возвращает {emp_id: value}."""
-    row_map = _load_row_map(year, month)
-    ws = get_or_create_sheet(year, month)
-    col = day_col(day)
-
-    # Собираем все строки одним запросом
-    result = {}
-    all_rows = []
-    emp_ids = []
-    for section_map in row_map.values():
-        for eid, row in section_map.items():
-            all_rows.append(row)
-            emp_ids.append(int(eid))
-
-    if not all_rows:
-        return {}
-
-    # Читаем всю колонку за раз
-    try:
-        col_data = ws.col_values(6 + day)  # 1-based, day=1 → col 7
-        for eid, row in zip(emp_ids, all_rows):
-            if row - 1 < len(col_data):
-                raw = col_data[row - 1]
-                try:
-                    result[eid] = float(raw) if raw else 0
-                except ValueError:
-                    result[eid] = raw
-    except Exception:
-        pass
-
-    return result
-
-
-def mark_employee_fired(emp_id: int, fired_date: str, year: int, month: int):
-    """Поставить отметку об увольнении в колонку удержания."""
+def mark_employee_fired(emp_id: int, fired_date: str, year: int, month: int) -> bool:
     row = get_employee_row(emp_id, year, month)
     if row is None:
         return False
     ws = get_or_create_sheet(year, month)
     total_days = days_in_month(year, month)
-    col = col_letter(6 + total_days + 1)
+    col = deduction_col(total_days)
     ws.update(f"{col}{row}", [[f"Уволен с {fired_date}"]], value_input_option="USER_ENTERED")
+    # Красим строку розовым
+    try:
+        ws.format(f"A{row}:{advance_col(total_days)}{row}", {
+            "backgroundColor": {"red": 1.0, "green": 0.8, "blue": 0.8}
+        })
+    except Exception:
+        pass
     return True
 
 
-def add_replacement_row(main_emp_id: int, replacer_emp_id: int,
-                        day: int, value, year: int, month: int):
+def add_replacement_row_to_sheet(main_emp_id: int, replacer_emp_id: int,
+                                  year: int, month: int):
     """
-    Добавить строку замены под основным сотрудником.
-    Если строка уже есть — просто записать значение.
+    Добавить строку замены в лист (вставить строку сразу под основным сотрудником).
+    Обновляет row_map.
     """
-    # Пока используем write_shift для строки заменяющего
-    return write_shift(replacer_emp_id, day, value, year, month)
+    from database import get_employee
+    main_emp = get_employee(main_emp_id)
+    rep_emp = get_employee(replacer_emp_id)
+    if not main_emp or not rep_emp:
+        return False
+
+    main_row = get_employee_row(main_emp_id, year, month)
+    if main_row is None:
+        return False
+
+    ws = get_or_create_sheet(year, month)
+    total_days = days_in_month(year, month)
+    n_cols = 6 + total_days + 2
+
+    # Новая строка = main_row + 1 (сдвигаем всё ниже)
+    new_row = main_row + 1
+
+    # Вставляем пустую строку
+    ws.insert_rows([[""]*n_cols], row=new_row)
+
+    # Формируем содержимое строки замены
+    rep_row = _build_replacement_row(rep_emp, main_emp, new_row, total_days)
+    ws.update(f"A{new_row}", [rep_row], value_input_option="USER_ENTERED")
+
+    # Обновляем row_map — все строки >= new_row сдвигаются +1
+    rm = _load_row_map(year, month)
+    new_rm = {}
+    for eid, r in rm.items():
+        if r >= new_row:
+            new_rm[eid] = r + 1
+        else:
+            new_rm[eid] = r
+    new_rm[str(replacer_emp_id)] = new_row
+    _save_row_map(year, month, new_rm)
+    return True
 
 
-def export_to_xlsx(year: int, month: int) -> str:
-    """
-    Экспортировать лист Google Sheets в .xlsx файл.
-    Возвращает путь к файлу.
-    """
-    import requests
+def read_shift(emp_id: int, day: int, year: int, month: int):
+    """Прочитать значение смены."""
+    row = get_employee_row(emp_id, year, month)
+    if row is None:
+        return None
+    ws = get_or_create_sheet(year, month)
+    val = ws.cell(row, 6 + day).value
+    return val
+
+
+# ─── Экспорт xlsx ─────────────────────────────────────────────────────────────
+
+def export_to_xlsx(year: int, month: int) -> Optional[str]:
+    """Экспортировать лист в .xlsx. Возвращает путь к файлу."""
     sp = _get_spreadsheet()
     sheet_name = f"{MONTH_NAMES_RU[month]} {year}"
-
-    # Получить gid листа
     try:
         ws = sp.worksheet(sheet_name)
         gid = ws.id
     except Exception:
         return None
 
-    # Экспорт через Google Sheets API
     url = (
         f"https://docs.google.com/spreadsheets/d/{SPREADSHEET_ID}/export"
         f"?format=xlsx&gid={gid}"
     )
 
-    # Получить токен из credentials
-    creds_json = GOOGLE_CREDS_JSON
-    if os.path.exists(creds_json):
-        with open(creds_json) as f:
+    creds_src = GOOGLE_CREDS_JSON
+    if os.path.exists(creds_src):
+        with open(creds_src) as f:
             info = json.load(f)
     else:
-        info = json.loads(creds_json)
+        info = json.loads(creds_src)
 
     scopes = ["https://www.googleapis.com/auth/drive"]
     creds = Credentials.from_service_account_info(info, scopes=scopes)
     creds.refresh(google.auth.transport.requests.Request())
 
-    headers = {"Authorization": f"Bearer {creds.token}"}
-    resp = requests.get(url, headers=headers)
-
+    resp = requests.get(url, headers={"Authorization": f"Bearer {creds.token}"})
     if resp.status_code == 200:
         filename = f"Табель_{sheet_name.replace(' ', '_')}.xlsx"
         with open(filename, "wb") as f:
             f.write(resp.content)
         return filename
-
     return None
