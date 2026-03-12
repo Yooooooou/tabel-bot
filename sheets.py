@@ -228,13 +228,7 @@ def build_sheet(year: int, month: int):
     ws.update("A1", all_data, value_input_option="USER_ENTERED")
 
     # ── Форматирование ──
-    try:
-        _format_sheet(ws, layout, total_days, year, month)
-    except Exception as e:
-        import logging, traceback
-        logging.getLogger(__name__).error(
-            f"Formatting failed: {e}\n{traceback.format_exc()}"
-        )
+    _format_sheet(ws, layout, total_days, year, month)
 
     _save_row_map(year, month, row_map)
     return ws, row_map
@@ -300,21 +294,19 @@ def _format_sheet(ws, layout: dict, total_days: int, year: int, month: int):
     n_cols = layout["total_cols"]
     reqs   = []
 
-    # Определяем выходные дни месяца (0-based column index = 5 + day)
     weekend_cols = [
         5 + d for d in range(1, total_days + 1)
-        if date(year, month, d).weekday() in (5, 6)  # сб=5, вс=6
+        if date(year, month, d).weekday() in (5, 6)
     ]
 
-    # ── 0. Базовый белый фон на весь лист ──
-    reqs += [
+    # Базовый фон
+    reqs.append(
         _fmt(sid, 0, 300, 0, n_cols,
-             bg=C_WHITE, fg=C_DARK_TEXT, halign="CENTER", valign="MIDDLE"),
-    ]
+             bg=C_WHITE, fg=C_DARK_TEXT, halign="CENTER", valign="MIDDLE")
+    )
 
-    # ── 1. Строка-заголовок листа ──
+    # Заголовок месяца
     tr = layout["title_row"] - 1
-
     title_start = max(8, 6 + total_days // 3)
     title_end = min(title_start + 4, n_cols)
 
@@ -327,13 +319,10 @@ def _format_sheet(ws, layout: dict, total_days: int, year: int, month: int):
     if title_start < title_end:
         reqs += [
             _fmt(sid, tr, tr+1, title_start, title_end,
-                 bg=C_PURPLE_TITLE, bold=True, font_size=12, fg=C_WHITE_TEXT,
-                 halign="CENTER", valign="MIDDLE", wrap="WRAP"),
-            _merge(sid, tr, tr+1, title_start, title_end),
-            _outline(sid, tr, tr+1, title_start, title_end),
+                 bg=C_PURPLE_TITLE, bold=True, font_size=12,
+                 fg=C_WHITE_TEXT, halign="CENTER", valign="MIDDLE", wrap="WRAP"),
         ]
 
-    # ── 2. Секции ──
     for sec in layout["sections"]:
 
         # Заголовок раздела
@@ -343,12 +332,10 @@ def _format_sheet(ws, layout: dict, total_days: int, year: int, month: int):
                 _fmt(sid, r, r+1, 0, n_cols,
                      bg=C_SECTION_LITE, bold=True, font_size=11,
                      fg=C_DARK_TEXT, halign="LEFT", valign="MIDDLE", wrap="WRAP"),
-                _merge(sid, r, r+1, 0, n_cols),
                 _row_height(sid, r, r+1, 28),
-                _outline(sid, r, r+1, 0, n_cols),
             ]
 
-        # Строка названий колонок
+        # Шапка колонок
         chr_ = sec["col_header_row"] - 1
         reqs += [
             _fmt(sid, chr_, chr_+1, 0, n_cols,
@@ -358,7 +345,6 @@ def _format_sheet(ws, layout: dict, total_days: int, year: int, month: int):
                  bg=C_HEADER_BLUE, bold=True, fg=C_WHITE_TEXT,
                  halign="LEFT", valign="MIDDLE", wrap="WRAP"),
             _row_height(sid, chr_, chr_+1, 30),
-            _outline(sid, chr_, chr_+1, 0, n_cols),
         ]
 
         for wc in weekend_cols:
@@ -386,7 +372,7 @@ def _format_sheet(ws, layout: dict, total_days: int, year: int, month: int):
 
         # Строки данных
         ds = sec["data_start"] - 1
-        de = sec["data_end"]  # exclusive
+        de = sec["data_end"]
         if ds < de:
             reqs += [
                 _fmt(sid, ds, de, 0, n_cols,
@@ -407,7 +393,8 @@ def _format_sheet(ws, layout: dict, total_days: int, year: int, month: int):
             rr = rep_row - 1
             reqs += [
                 _fmt(sid, rr, rr+1, 0, n_cols,
-                     bg=C_REPLACE, fg=C_DARK_TEXT, halign="CENTER", valign="MIDDLE"),
+                     bg=C_REPLACE, fg=C_DARK_TEXT,
+                     halign="CENTER", valign="MIDDLE"),
                 _fmt(sid, rr, rr+1, 0, 1,
                      bg=C_REPLACE, halign="LEFT", valign="MIDDLE"),
                 _fmt(sid, rr, rr+1, 2, 3,
@@ -424,29 +411,28 @@ def _format_sheet(ws, layout: dict, total_days: int, year: int, month: int):
                  bg=C_TOTAL_LITE, bold=True, fg=C_DARK_TEXT,
                  halign="LEFT", valign="MIDDLE"),
             _row_height(sid, totr, totr+1, 24),
-            _outline(sid, totr, totr+1, 0, n_cols),
         ]
 
-    # ── 3. Границы ──
+    # Границы
     last_row = max(
         (s["total_row"] for s in layout["sections"] if s.get("total_row")),
         default=50
     )
     reqs.append(_borders_light(sid, 0, last_row, 0, n_cols))
 
-    # ── 4. Ширина колонок ──
+    # Ширины колонок
     col_widths = [
-        (0, 1, 190),   # ФИО
-        (1, 2, 120),   # Номер
-        (2, 3, 130),   # Должность
-        (3, 4, 60),    # График
-        (4, 5, 90),    # План
-        (5, 6, 90),    # Факт/часы
+        (0, 1, 190),
+        (1, 2, 120),
+        (2, 3, 130),
+        (3, 4, 60),
+        (4, 5, 90),
+        (5, 6, 90),
     ]
     for d in range(1, total_days + 1):
-        col_widths.append((5+d, 6+d, 30))  # дни
-    col_widths.append((6+total_days, 6+total_days+1, 110))  # Удержание
-    col_widths.append((6+total_days+1, 6+total_days+2, 95)) # Аванс
+        col_widths.append((5 + d, 6 + d, 30))
+    col_widths.append((6 + total_days, 6 + total_days + 1, 110))
+    col_widths.append((6 + total_days + 1, 6 + total_days + 2, 95))
 
     for cs, ce, px in col_widths:
         reqs.append({
@@ -462,7 +448,7 @@ def _format_sheet(ws, layout: dict, total_days: int, year: int, month: int):
             }
         })
 
-    # ── 5. Заморозка ──
+    # Заморозка
     reqs.append({
         "updateSheetProperties": {
             "properties": {
@@ -475,10 +461,9 @@ def _format_sheet(ws, layout: dict, total_days: int, year: int, month: int):
             "fields": "gridProperties.frozenColumnCount,gridProperties.frozenRowCount",
         }
     })
-    print("FORMAT REQUESTS:", len(reqs))
-    reqs.append(_fmt(sid, 0, 3, 0, 5, bg={"red": 1, "green": 0.8, "blue": 0.8}, bold=True))
-    ws.spreadsheet.batch_update({"requests": reqs})
 
+    print("FORMAT REQUESTS:", len(reqs))
+    ws.spreadsheet.batch_update({"requests": reqs})
 # ─── Хелперы для Sheets API requests ─────────────────────────────────────────
 
 def _fmt(sid: int, r0: int, r1: int, c0: int, c1: int,
