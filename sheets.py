@@ -237,10 +237,11 @@ def build_sheet(year: int, month: int):
 
     # ── Секции ──
     for section in SECTIONS:
-        sec_emps = [
-            e for e in employees
-            if e["section"] == section and not e.get("is_replacement_for")
-        ]
+        sec_emps = sorted(
+            [e for e in employees
+             if e["section"] == section and not e.get("is_replacement_for")],
+            key=lambda e: (e.get("position", "").lower(), e.get("sort_order", e["id"]))
+        )
         if not sec_emps and section != SECTIONS[0]:
             continue
 
@@ -411,9 +412,7 @@ def _build_replacement_row(rep: dict, main_emp: dict, row: int, total_days: int,
         saved_days = saved_days[:total_days]
 
     percent_str  = rep.get("percent", "")
-    display_name = f"{rep['name']} (замена за {main_emp['name']})"
-    if percent_str:
-        display_name = f"{rep['name']} {percent_str} (замена за {main_emp['name']})"
+    display_name = f"{rep['name']} {percent_str}".strip() if percent_str else rep["name"]
 
     base = [
         display_name,

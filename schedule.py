@@ -31,18 +31,13 @@ def calc_plan_shifts(employee: dict, year: int, month: int) -> Optional[int]:
         except ValueError:
             return None
         # Считаем рабочие дни в месяце по циклу 2/2
+        # Дни ДО start_date не считаем (сотрудник ещё не работал)
         count = 0
         for day in range(1, total_days + 1):
             d = date(year, month, day)
             delta = (d - start).days
-            # В цикле 2/2: дни 0,1 = рабочие, 2,3 = выходные
             if delta >= 0 and (delta % 4) < 2:
                 count += 1
-            elif delta < 0:
-                # до стартовой даты — обратный счёт
-                back_delta = (start - d).days
-                if (back_delta % 4) < 2:
-                    count += 1
         return count
 
     elif schedule == "5/2":
