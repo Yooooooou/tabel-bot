@@ -47,7 +47,7 @@ logger = logging.getLogger(__name__)
 def _main_menu_text() -> str:
     t = today_tz()
     return (f"🏠 <b>Главное меню</b>\n"
-            f"📅 {t.day} {MONTH_NAMES_RU[t.month]} {t.year}")
+            f"📅 {t.day} {MONTH_NAMES_RU[t.month]} {t.year} г.")
 
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
