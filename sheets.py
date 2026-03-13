@@ -1,6 +1,18 @@
 """
 Google Sheets: создание и обновление табеля с полным форматированием.
 Структура и визуал повторяют шаблон Н8.
+
+Колонки:
+  A  = ФИО (+ процент рядом с именем, например «Иванов И. 6%»)
+  B  = Номер
+  C  = Должность
+  D  = График
+  E  = Кол-во раб.дн (план)   / пусто для раннеров
+  F  = Кол-во отр.дн (факт)   / Кол-во отр.часов для раннеров
+  G… = День 1 … День N
+  +1 = Удержание
+  +2 = Аванс
+  +3 = Примечание (увольнение и т.п.)
 """
 import json
 import os
@@ -22,21 +34,21 @@ from schedule import calc_plan_shifts, weekday_name_ru, days_in_month
 
 # ─── Цветовая палитра (RGB 0-1) ───────────────────────────────────────────────
 
-# ─── Цветовая палитра (RGB 0-1) ───────────────────────────────────────────────
-
-C_HEADER_BLUE   = {"red": 0.365, "green": 0.600, "blue": 0.800}   # основная синяя шапка
-C_HEADER_DARK   = {"red": 0.290, "green": 0.510, "blue": 0.710}   # более тёмный синий
-C_PURPLE_TITLE  = {"red": 0.533, "green": 0.459, "blue": 0.761}   # фиолетовый блок месяца
-C_SECTION_LITE  = {"red": 0.914, "green": 0.882, "blue": 0.961}   # светлый заголовок раздела
-C_TOTAL_LITE    = {"red": 0.824, "green": 0.906, "blue": 0.980}   # итоговая строка
-C_WEEKEND       = {"red": 0.992, "green": 0.929, "blue": 0.780}   # мягкий жёлтый
-C_WEEKEND_HDR   = {"red": 0.902, "green": 0.792, "blue": 0.490}   # заголовок выходных
-C_REPLACE       = {"red": 0.937, "green": 0.894, "blue": 0.988}   # строки замены
-C_FIRED         = {"red": 1.000, "green": 0.800, "blue": 0.800}   # уволенные
+C_HEADER_BLUE   = {"red": 0.365, "green": 0.600, "blue": 0.800}
+C_HEADER_DARK   = {"red": 0.290, "green": 0.510, "blue": 0.710}
+C_PURPLE_TITLE  = {"red": 0.533, "green": 0.459, "blue": 0.761}
+C_SECTION_LITE  = {"red": 0.914, "green": 0.882, "blue": 0.961}
+C_TOTAL_LITE    = {"red": 0.824, "green": 0.906, "blue": 0.980}
+C_WEEKEND       = {"red": 0.992, "green": 0.929, "blue": 0.780}
+C_WEEKEND_HDR   = {"red": 0.902, "green": 0.792, "blue": 0.490}
+C_REPLACE       = {"red": 0.937, "green": 0.894, "blue": 0.988}
+C_FIRED         = {"red": 1.000, "green": 0.800, "blue": 0.800}
 C_WHITE         = {"red": 1.000, "green": 1.000, "blue": 1.000}
 C_WHITE_TEXT    = {"red": 1.000, "green": 1.000, "blue": 1.000}
 C_DARK_TEXT     = {"red": 0.133, "green": 0.133, "blue": 0.133}
-C_GRID          = {"red": 0.780, "green": 0.780, "blue": 0.780}
+C_GRID          = {"red": 0.400, "green": 0.400, "blue": 0.400}   # тёмные границы
+C_GRID_INNER    = {"red": 0.650, "green": 0.650, "blue": 0.650}   # внутренние границы
+
 
 # ─── Подключение ──────────────────────────────────────────────────────────────
 
@@ -53,28 +65,29 @@ def _get_spreadsheet():
     gc = gspread.authorize(creds)
     return gc.open_by_key(SPREADSHEET_ID)
 
+
 def get_or_create_sheet(year: int, month: int):
     sheet_name = f"{MONTH_NAMES_RU[month]} {year}"
     sp = _get_spreadsheet()
     try:
         return sp.worksheet(sheet_name)
     except gspread.WorksheetNotFound:
-        ws = sp.add_worksheet(title=sheet_name, rows=300, cols=45)
+        ws = sp.add_worksheet(title=sheet_name, rows=300, cols=50)
         return ws
-    
-    
+
+
 def recreate_sheet(year: int, month: int):
     sheet_name = f"{MONTH_NAMES_RU[month]} {year}"
     sp = _get_spreadsheet()
-
     try:
         old_ws = sp.worksheet(sheet_name)
         sp.del_worksheet(old_ws)
     except gspread.WorksheetNotFound:
         pass
-
-    ws = sp.add_worksheet(title=sheet_name, rows=300, cols=45)
+    ws = sp.add_worksheet(title=sheet_name, rows=300, cols=50)
     return ws
+
+
 def get_sheet_if_exists(year: int, month: int):
     sheet_name = f"{MONTH_NAMES_RU[month]} {year}"
     sp = _get_spreadsheet()
@@ -84,18 +97,43 @@ def get_sheet_if_exists(year: int, month: int):
         return None
 
 
+# ─── Колонки ──────────────────────────────────────────────────────────────────
+
+def col_letter(n: int) -> str:
+    result = ""
+    while n > 0:
+        n, r = divmod(n - 1, 26)
+        result = chr(65 + r) + result
+    return result
+
+
+def day_col(day: int) -> str:
+    return col_letter(6 + day)
+
+
+def deduction_col(total_days: int) -> str:
+    return col_letter(6 + total_days + 1)
+
+
+def advance_col(total_days: int) -> str:
+    return col_letter(6 + total_days + 2)
+
+
+def note_col(total_days: int) -> str:
+    """Примечание: увольнение и прочее."""
+    return col_letter(6 + total_days + 3)
+
+
+def _n_cols(total_days: int) -> int:
+    return 6 + total_days + 3
+
+
+# ─── Сохранение/загрузка состояния листа ──────────────────────────────────────
+
 def _load_existing_sheet_state(year: int, month: int, total_days: int) -> dict:
     """
-    Считывает уже проставленные смены/удержание/аванс из текущего листа
-    перед его пересозданием.
-    Возвращает:
-    {
-        "emp_id": {
-            "days": [...],
-            "deduction": "...",
-            "advance": "..."
-        }
-    }
+    Считывает уже проставленные смены/удержание/аванс/процент/примечание
+    из текущего листа перед его пересозданием.
     """
     ws = get_sheet_if_exists(year, month)
     if ws is None:
@@ -115,70 +153,36 @@ def _load_existing_sheet_state(year: int, month: int, total_days: int) -> dict:
                 continue
 
             row_vals = values[row - 1]
-
-            # добиваем строку до нужной длины
-            need_len = 6 + total_days + 2
+            need_len = _n_cols(total_days)
             if len(row_vals) < need_len:
                 row_vals += [""] * (need_len - len(row_vals))
 
             day_values = row_vals[6:6 + total_days]
-            deduction = row_vals[6 + total_days]
-            advance = row_vals[6 + total_days + 1]
+            deduction  = row_vals[6 + total_days]
+            advance    = row_vals[6 + total_days + 1]
+            note       = row_vals[6 + total_days + 2]
 
-            normalized_days = []
-            for v in day_values:
-                if v == "":
-                    normalized_days.append(0)
-                else:
-                    normalized_days.append(v)
+            normalized_days = [v if v != "" else 0 for v in day_values]
 
             state[str(emp_id)] = {
-                "days": normalized_days,
+                "days":      normalized_days,
                 "deduction": deduction,
-                "advance": advance,
+                "advance":   advance,
+                "note":      note,
             }
         except Exception:
             continue
 
     return state
+
+
 def _schedule_as_text(value) -> str:
-    """
-    Чтобы Google Sheets не превращал 2/2 или 5/2 в дату/формулу.
-    Апостроф в таблице не отображается, но заставляет хранить значение как текст.
-    """
     if value is None:
         return ""
     value = str(value).strip()
     if not value:
         return ""
     return f"'{value}"
-
-# ─── Колонки ──────────────────────────────────────────────────────────────────
-# 1=A  ФИО
-# 2=B  Номер
-# 3=C  Должность
-# 4=D  График
-# 5=E  Кол-во раб.дн (план)  / пусто для раннеров
-# 6=F  Кол-во отр.дн (факт)  / Кол-во отр.часов для раннеров
-# 7=G  День 1 … 6+total_days = последний день
-# 6+total_days+1 = Удержание
-# 6+total_days+2 = Аванс
-
-def col_letter(n: int) -> str:
-    result = ""
-    while n > 0:
-        n, r = divmod(n - 1, 26)
-        result = chr(65 + r) + result
-    return result
-
-def day_col(day: int) -> str:
-    return col_letter(6 + day)
-
-def deduction_col(total_days: int) -> str:
-    return col_letter(6 + total_days + 1)
-
-def advance_col(total_days: int) -> str:
-    return col_letter(6 + total_days + 2)
 
 
 # ─── Построение табеля ────────────────────────────────────────────────────────
@@ -188,12 +192,12 @@ def build_sheet(year: int, month: int):
     Полностью пересобрать лист табеля с форматированием.
     Возвращает (worksheet, row_map).
     """
-    employees   = get_all_employees()
-    total_days  = days_in_month(year, month)
+    employees      = get_all_employees()
+    total_days     = days_in_month(year, month)
     existing_state = _load_existing_sheet_state(year, month, total_days)
 
-    ws = recreate_sheet(year, month)
-    n_cols      = 6 + total_days + 2
+    ws     = recreate_sheet(year, month)
+    n_cols = _n_cols(total_days)
 
     all_data    = []
     row_map     = {}
@@ -206,14 +210,14 @@ def build_sheet(year: int, month: int):
         "sections":  [],
     }
 
-        # ── Заголовок листа (строка 1) ──
+    # ── Заголовок листа (строка 1) ──
     title_row = [""] * n_cols
     title_start = max(8, 6 + total_days // 3)
     if title_start >= n_cols:
         title_start = 0
     title_row[title_start] = f"{MONTH_NAMES_RU[month]} {year}"
     all_data.append(title_row)
-    all_data.append([""] * n_cols)   # пустая строка-отступ
+    all_data.append([""] * n_cols)
     current_row += 2
 
     # ── Секции ──
@@ -226,14 +230,16 @@ def build_sheet(year: int, month: int):
             continue
 
         sec_info = {
-            "section":            section,
-            "section_header_row": None,
-            "col_header_row":     None,
-            "dow_row":            None,
-            "data_start":         None,
-            "data_end":           None,
-            "total_row":          None,
-            "replacement_rows":   [],
+            "section":              section,
+            "section_header_row":   None,
+            "col_header_row":       None,
+            "dow_row":              None,
+            "data_start":           None,
+            "data_end":             None,
+            "total_row":            None,
+            "replacement_rows":     [],
+            "plan_merge_ranges":    [],   # [(main_row, last_rep_row), ...]
+            "fired_rows":           [],
         }
 
         # Заголовок раздела
@@ -251,9 +257,9 @@ def build_sheet(year: int, month: int):
         if section == "runners":
             col_headers = ["Ф.И.О.", "Номер", "Должность", "", "", "Кол-во отр.часов"]
         else:
-            col_headers = ["Ф.И.О.", "Номер", "Должность", "график",
+            col_headers = ["Ф.И.О.", "Номер", "Должность", "График",
                            "Кол-во раб.дн", "Кол-во отр.дн"]
-        col_headers += list(range(1, total_days + 1)) + ["Удержание", "Аванс"]
+        col_headers += list(range(1, total_days + 1)) + ["Удержание", "Аванс", "Примечание"]
         all_data.append(col_headers)
         sec_info["col_header_row"] = current_row
         current_row += 1
@@ -262,7 +268,7 @@ def build_sheet(year: int, month: int):
         dow_row = ["", "", "", "", "", ""]
         for d in range(1, total_days + 1):
             dow_row.append(weekday_name_ru(d, year, month))
-        dow_row += ["", ""]
+        dow_row += ["", "", ""]
         all_data.append(dow_row)
         sec_info["dow_row"] = current_row
         current_row += 1
@@ -271,11 +277,14 @@ def build_sheet(year: int, month: int):
         sec_info["data_start"] = current_row
 
         for emp in sec_emps:
-            emp_row = _build_emp_row(
-    emp, section, current_row, year, month, total_days, existing_state
-)
+            main_row = current_row
+            emp_row  = _build_emp_row(
+                emp, section, current_row, year, month, total_days, existing_state
+            )
             all_data.append(emp_row)
             row_map[emp["id"]] = current_row
+            if emp.get("fired"):
+                sec_info["fired_rows"].append(current_row)
             current_row += 1
 
             # Строки замен
@@ -290,12 +299,17 @@ def build_sheet(year: int, month: int):
                 sec_info["replacement_rows"].append(current_row)
                 current_row += 1
 
+            # Объединение ячейки "план смен" (E) для замен
+            if replacements:
+                sec_info["plan_merge_ranges"].append((main_row, current_row - 1))
+
         sec_info["data_end"] = current_row - 1
 
         # Итоговая строка
-        total_row = _build_total_row(section, sec_info["data_start"],
-                                     sec_info["data_end"], total_days, n_cols)
-        all_data.append(total_row)
+        total_row_data = _build_total_row(
+            section, sec_info["data_start"], sec_info["data_end"], total_days, n_cols
+        )
+        all_data.append(total_row_data)
         sec_info["total_row"] = current_row
         current_row += 1
 
@@ -321,31 +335,33 @@ def _build_emp_row(emp: dict, section: str, row: int,
                    year: int, month: int, total_days: int,
                    existing_state: dict = None) -> list:
     plan = None if section == "runners" else calc_plan_shifts(emp, year, month)
-    fired_str = f"Уволен с {emp.get('fired_date', '')}" if emp.get("fired") else ""
 
-    existing_state = existing_state or {}
-    saved = existing_state.get(str(emp["id"]), {})
-    saved_days = saved.get("days", [0] * total_days)
+    existing_state  = existing_state or {}
+    saved           = existing_state.get(str(emp["id"]), {})
+    saved_days      = saved.get("days",      [0] * total_days)
     saved_deduction = saved.get("deduction", "")
-    saved_advance = saved.get("advance", "")
+    saved_advance   = saved.get("advance",   "")
 
     if len(saved_days) < total_days:
         saved_days = saved_days + [0] * (total_days - len(saved_days))
     else:
         saved_days = saved_days[:total_days]
 
+    # Процент отображается рядом с именем: «Иванов И. 6%»
+    percent_str  = emp.get("percent", "")
+    display_name = f"{emp['name']} {percent_str}" if percent_str else emp["name"]
+
     if section == "runners":
         base = [
-            emp["name"],
+            display_name,
             emp.get("phone", ""),
             emp.get("position", "Раннер"),
-            "",
-            "",
+            "", "",
             f"=SUM({day_col(1)}{row}:{day_col(total_days)}{row})"
         ]
     else:
         base = [
-            emp["name"],
+            display_name,
             emp.get("phone", ""),
             emp.get("position", ""),
             _schedule_as_text(emp.get("schedule", "")),
@@ -354,32 +370,50 @@ def _build_emp_row(emp: dict, section: str, row: int,
         ]
 
     base += saved_days
-    base += [fired_str or saved_deduction or "", saved_advance]
+
+    # Уволен — примечание в отдельный последний столбец, НЕ в удержание
+    fired_note = f"Уволен с {emp.get('fired_date', '')}" if emp.get("fired") else ""
+
+    base += [
+        saved_deduction or "",
+        saved_advance   or "",
+        fired_note      or "",
+    ]
     return base
+
 
 def _build_replacement_row(rep: dict, main_emp: dict, row: int, total_days: int,
                            existing_state: dict = None) -> list:
-    existing_state = existing_state or {}
-    saved = existing_state.get(str(rep["id"]), {})
-    saved_days = saved.get("days", [0] * total_days)
+    existing_state  = existing_state or {}
+    saved           = existing_state.get(str(rep["id"]), {})
+    saved_days      = saved.get("days",      [0] * total_days)
     saved_deduction = saved.get("deduction", "")
-    saved_advance = saved.get("advance", "")
+    saved_advance   = saved.get("advance",   "")
 
     if len(saved_days) < total_days:
         saved_days = saved_days + [0] * (total_days - len(saved_days))
     else:
         saved_days = saved_days[:total_days]
 
+    percent_str  = rep.get("percent", "")
+    display_name = f"{rep['name']} (замена за {main_emp['name']})"
+    if percent_str:
+        display_name = f"{rep['name']} {percent_str} (замена за {main_emp['name']})"
+
     base = [
-        f"{rep['name']} (замена за {main_emp['name']})",
+        display_name,
         rep.get("phone", ""),
         rep.get("position", main_emp.get("position", "")),
         "",
-        "",
+        "",   # E — пусто, будет объединено с plan-ячейкой основного сотрудника
         f"=SUM({day_col(1)}{row}:{day_col(total_days)}{row})",
     ]
     base += saved_days
-    base += [saved_deduction, saved_advance]
+    base += [
+        saved_deduction or "",
+        saved_advance   or "",
+        "",  # Примечание
+    ]
     return base
 
 
@@ -387,7 +421,6 @@ def _build_total_row(section: str, start_row: int, end_row: int,
                      total_days: int, n_cols: int) -> list:
     total_row = [""] * n_cols
     if start_row > end_row:
-        # Empty section — no employees, skip formulas to avoid #REF!
         return total_row
     if section == "runners":
         total_row[5] = f"=SUM(F{start_row}:F{end_row})"
@@ -411,7 +444,7 @@ def _format_sheet(ws, layout: dict, total_days: int, year: int, month: int):
         if date(year, month, d).weekday() in (5, 6)
     ]
 
-    # Базовый фон
+    # Базовый фон всего листа
     reqs.append(
         _fmt(sid, 0, 300, 0, n_cols,
              bg=C_WHITE, fg=C_DARK_TEXT, halign="CENTER", valign="MIDDLE")
@@ -420,20 +453,19 @@ def _format_sheet(ws, layout: dict, total_days: int, year: int, month: int):
     # Заголовок месяца
     tr = layout["title_row"] - 1
     title_start = max(8, 6 + total_days // 3)
-    title_end = min(title_start + 4, n_cols)
+    title_end   = min(title_start + 4, n_cols)
 
     reqs += [
         _fmt(sid, tr, tr+1, 0, n_cols,
              bg=C_WHITE, fg=C_DARK_TEXT, halign="LEFT", valign="MIDDLE"),
         _row_height(sid, tr, tr+1, 34),
     ]
-
     if title_start < title_end:
-        reqs += [
+        reqs.append(
             _fmt(sid, tr, tr+1, title_start, title_end,
                  bg=C_PURPLE_TITLE, bold=True, font_size=12,
-                 fg=C_WHITE_TEXT, halign="CENTER", valign="MIDDLE", wrap="WRAP"),
-        ]
+                 fg=C_WHITE_TEXT, halign="CENTER", valign="MIDDLE", wrap="WRAP")
+        )
 
     for sec in layout["sections"]:
 
@@ -445,6 +477,7 @@ def _format_sheet(ws, layout: dict, total_days: int, year: int, month: int):
                      bg=C_SECTION_LITE, bold=True, font_size=11,
                      fg=C_DARK_TEXT, halign="LEFT", valign="MIDDLE", wrap="WRAP"),
                 _row_height(sid, r, r+1, 28),
+                _borders_all(sid, r, r+1, 0, n_cols, C_GRID),
             ]
 
         # Шапка колонок
@@ -457,8 +490,8 @@ def _format_sheet(ws, layout: dict, total_days: int, year: int, month: int):
                  bg=C_HEADER_BLUE, bold=True, fg=C_WHITE_TEXT,
                  halign="LEFT", valign="MIDDLE", wrap="WRAP"),
             _row_height(sid, chr_, chr_+1, 30),
+            _borders_all(sid, chr_, chr_+1, 0, n_cols, C_GRID),
         ]
-
         for wc in weekend_cols:
             reqs.append(
                 _fmt(sid, chr_, chr_+1, wc, wc+1,
@@ -473,8 +506,8 @@ def _format_sheet(ws, layout: dict, total_days: int, year: int, month: int):
                  bg=C_WHITE, bold=True, fg=C_DARK_TEXT,
                  halign="CENTER", valign="MIDDLE"),
             _row_height(sid, dwr, dwr+1, 22),
+            _borders_all(sid, dwr, dwr+1, 0, n_cols, C_GRID_INNER),
         ]
-
         for wc in weekend_cols:
             reqs.append(
                 _fmt(sid, dwr, dwr+1, wc, wc+1,
@@ -495,8 +528,8 @@ def _format_sheet(ws, layout: dict, total_days: int, year: int, month: int):
                 _fmt(sid, ds, de, 2, 3,
                      bg=C_WHITE, halign="LEFT", valign="MIDDLE"),
                 _row_height(sid, ds, de, 22),
+                _borders_all(sid, ds, de, 0, n_cols, C_GRID_INNER),
             ]
-
             for wc in weekend_cols:
                 reqs.append(_fmt(sid, ds, de, wc, wc+1, bg=C_WEEKEND))
 
@@ -511,6 +544,21 @@ def _format_sheet(ws, layout: dict, total_days: int, year: int, month: int):
                      bg=C_REPLACE, halign="LEFT", valign="MIDDLE"),
                 _fmt(sid, rr, rr+1, 2, 3,
                      bg=C_REPLACE, halign="LEFT", valign="MIDDLE"),
+                _borders_all(sid, rr, rr+1, 0, n_cols, C_GRID_INNER),
+            ]
+
+        # Строки уволенных
+        for fired_row in sec.get("fired_rows", []):
+            fr = fired_row - 1
+            reqs += [
+                _fmt(sid, fr, fr+1, 0, n_cols,
+                     bg=C_FIRED, fg=C_DARK_TEXT,
+                     halign="CENTER", valign="MIDDLE"),
+                _fmt(sid, fr, fr+1, 0, 1,
+                     bg=C_FIRED, halign="LEFT", valign="MIDDLE"),
+                _fmt(sid, fr, fr+1, 2, 3,
+                     bg=C_FIRED, halign="LEFT", valign="MIDDLE"),
+                _borders_all(sid, fr, fr+1, 0, n_cols, C_GRID),
             ]
 
         # Итоговая строка
@@ -523,14 +571,17 @@ def _format_sheet(ws, layout: dict, total_days: int, year: int, month: int):
                  bg=C_TOTAL_LITE, bold=True, fg=C_DARK_TEXT,
                  halign="LEFT", valign="MIDDLE"),
             _row_height(sid, totr, totr+1, 24),
+            _borders_all(sid, totr, totr+1, 0, n_cols, C_GRID),
         ]
 
-    # Границы
-    last_row = max(
-        (s["total_row"] for s in layout["sections"] if s.get("total_row")),
-        default=50
-    )
-    reqs.append(_borders_light(sid, 0, last_row, 0, n_cols))
+        # Жирная рамка вокруг всего раздела (от шапки до итогов)
+        section_top = (sec["col_header_row"] - 1)
+        section_bot = sec["total_row"]
+        reqs.append(_outline(sid, section_top, section_bot, 0, n_cols))
+
+        # Объединение ячейки «план смен» (E, col index 4) для замен
+        for main_r, last_rep_r in sec.get("plan_merge_ranges", []):
+            reqs.append(_merge(sid, main_r - 1, last_rep_r, 4, 5))
 
     # Ширины колонок
     col_widths = [
@@ -543,8 +594,9 @@ def _format_sheet(ws, layout: dict, total_days: int, year: int, month: int):
     ]
     for d in range(1, total_days + 1):
         col_widths.append((5 + d, 6 + d, 30))
-    col_widths.append((6 + total_days, 6 + total_days + 1, 110))
-    col_widths.append((6 + total_days + 1, 6 + total_days + 2, 95))
+    col_widths.append((6 + total_days,     6 + total_days + 1, 110))  # Удержание
+    col_widths.append((6 + total_days + 1, 6 + total_days + 2, 95))   # Аванс
+    col_widths.append((6 + total_days + 2, 6 + total_days + 3, 150))  # Примечание
 
     for cs, ce, px in col_widths:
         reqs.append({
@@ -559,24 +611,16 @@ def _format_sheet(ws, layout: dict, total_days: int, year: int, month: int):
                 "fields": "pixelSize",
             }
         })
-    # Колонка "График" как текст
+
+    # Колонка «График» — текстовый формат
     reqs.append({
         "repeatCell": {
-            "range": {
-                "sheetId": sid,
-                "startColumnIndex": 3,
-                "endColumnIndex": 4
-            },
-            "cell": {
-                "userEnteredFormat": {
-                    "numberFormat": {
-                        "type": "TEXT"
-                    }
-                }
-            },
+            "range": {"sheetId": sid, "startColumnIndex": 3, "endColumnIndex": 4},
+            "cell": {"userEnteredFormat": {"numberFormat": {"type": "TEXT"}}},
             "fields": "userEnteredFormat.numberFormat"
         }
     })
+
     # Заморозка
     reqs.append({
         "updateSheetProperties": {
@@ -591,8 +635,10 @@ def _format_sheet(ws, layout: dict, total_days: int, year: int, month: int):
         }
     })
 
-    print("FORMAT REQUESTS:", len(reqs))
+    print(f"FORMAT REQUESTS: {len(reqs)}")
     ws.spreadsheet.batch_update({"requests": reqs})
+
+
 # ─── Хелперы для Sheets API requests ─────────────────────────────────────────
 
 def _fmt(sid: int, r0: int, r1: int, c0: int, c1: int,
@@ -600,10 +646,8 @@ def _fmt(sid: int, r0: int, r1: int, c0: int, c1: int,
          font_size: int = None, halign: str = None,
          valign: str = None, wrap: str = None) -> dict:
     fmt = {}
-
     if bg is not None:
         fmt["backgroundColor"] = bg
-
     tf = {}
     if bold is not None:
         tf["bold"] = bold
@@ -613,7 +657,6 @@ def _fmt(sid: int, r0: int, r1: int, c0: int, c1: int,
         tf["fontSize"] = font_size
     if tf:
         fmt["textFormat"] = tf
-
     if halign is not None:
         fmt["horizontalAlignment"] = halign
     if valign is not None:
@@ -625,15 +668,15 @@ def _fmt(sid: int, r0: int, r1: int, c0: int, c1: int,
         "repeatCell": {
             "range": {
                 "sheetId": sid,
-                "startRowIndex": r0,
-                "endRowIndex": r1,
-                "startColumnIndex": c0,
-                "endColumnIndex": c1
+                "startRowIndex": r0, "endRowIndex": r1,
+                "startColumnIndex": c0, "endColumnIndex": c1
             },
             "cell": {"userEnteredFormat": fmt},
             "fields": "userEnteredFormat",
         }
     }
+
+
 def _merge(sid: int, r0: int, r1: int, c0: int, c1: int) -> dict:
     return {
         "mergeCells": {
@@ -654,8 +697,14 @@ def _row_height(sid: int, r0: int, r1: int, px: int) -> dict:
             "fields": "pixelSize",
         }
     }
-def _borders_light(sid: int, r0: int, r1: int, c0: int, c1: int) -> dict:
-    b = {"style": "SOLID", "color": C_GRID}
+
+
+def _borders_all(sid: int, r0: int, r1: int, c0: int, c1: int,
+                 color: dict = None) -> dict:
+    """Все границы (внешние + внутренние) одним цветом."""
+    if color is None:
+        color = C_GRID_INNER
+    b = {"style": "SOLID", "color": color}
     return {
         "updateBorders": {
             "range": {
@@ -670,6 +719,7 @@ def _borders_light(sid: int, r0: int, r1: int, c0: int, c1: int) -> dict:
 
 
 def _outline(sid: int, r0: int, r1: int, c0: int, c1: int) -> dict:
+    """Только внешняя рамка — толстая."""
     b = {"style": "SOLID_MEDIUM", "color": C_GRID}
     return {
         "updateBorders": {
@@ -682,17 +732,6 @@ def _outline(sid: int, r0: int, r1: int, c0: int, c1: int) -> dict:
         }
     }
 
-def _borders(sid: int, r0: int, r1: int, c0: int, c1: int) -> dict:
-    b = {"style": "SOLID", "color": C_GRID}
-    return {
-        "updateBorders": {
-            "range": {"sheetId": sid,
-                      "startRowIndex": r0, "endRowIndex": r1,
-                      "startColumnIndex": c0, "endColumnIndex": c1},
-            "top": b, "bottom": b, "left": b, "right": b,
-            "innerHorizontal": b, "innerVertical": b,
-        }
-    }
 
 # ─── row_map кэш ──────────────────────────────────────────────────────────────
 
@@ -741,25 +780,42 @@ def write_finance(emp_id: int, field: str, value, year: int, month: int) -> bool
     return True
 
 
+def write_employee_percent(emp_id: int, percent_str: str, year: int, month: int) -> bool:
+    """Обновляет имя сотрудника в ячейке A с добавлением процента."""
+    from database import get_employee
+    row = get_employee_row(emp_id, year, month)
+    if row is None:
+        return False
+    emp = get_employee(emp_id)
+    if not emp:
+        return False
+    display_name = f"{emp['name']} {percent_str}" if percent_str else emp["name"]
+    ws = get_or_create_sheet(year, month)
+    ws.update(f"A{row}", [[display_name]], value_input_option="USER_ENTERED")
+    return True
+
+
 def mark_employee_fired(emp_id: int, fired_date: str, year: int, month: int) -> bool:
+    """Пишет дату увольнения в колонку «Примечание» и красит строку."""
     row = get_employee_row(emp_id, year, month)
     if row is None:
         return False
     ws = get_or_create_sheet(year, month)
     total_days = days_in_month(year, month)
-    col = deduction_col(total_days)
+    col = note_col(total_days)
     ws.update(f"{col}{row}", [[f"Уволен с {fired_date}"]], value_input_option="USER_ENTERED")
-    # Красим строку розовым
     try:
-        sid = ws.id
+        sid    = ws.id
+        n_cols = _n_cols(total_days)
         ws.spreadsheet.batch_update({"requests": [
-            _fmt(sid, row-1, row, 0, 6 + total_days + 2,
+            _fmt(sid, row-1, row, 0, n_cols,
                  bg=C_FIRED, fg=C_DARK_TEXT, halign="CENTER", valign="MIDDLE"),
             _fmt(sid, row-1, row, 0, 1,
                  bg=C_FIRED, halign="LEFT", valign="MIDDLE"),
             _fmt(sid, row-1, row, 2, 3,
                  bg=C_FIRED, halign="LEFT", valign="MIDDLE"),
-            _outline(sid, row-1, row, 0, 6 + total_days + 2),
+            _borders_all(sid, row-1, row, 0, n_cols, C_GRID),
+            _outline(sid, row-1, row, 0, n_cols),
         ]})
     except Exception:
         pass
@@ -780,14 +836,13 @@ def add_replacement_row_to_sheet(main_emp_id: int, replacer_emp_id: int,
 
     ws         = get_or_create_sheet(year, month)
     total_days = days_in_month(year, month)
-    n_cols     = 6 + total_days + 2
+    n_cols     = _n_cols(total_days)
     new_row    = main_row + 1
 
     ws.insert_rows([[""]*n_cols], row=new_row)
-    rep_row = _build_replacement_row(rep_emp, main_emp, new_row, total_days)
-    ws.update(f"A{new_row}", [rep_row], value_input_option="USER_ENTERED")
+    rep_row_data = _build_replacement_row(rep_emp, main_emp, new_row, total_days)
+    ws.update(f"A{new_row}", [rep_row_data], value_input_option="USER_ENTERED")
 
-    # Форматируем строку замены
     try:
         sid = ws.id
         ws.spreadsheet.batch_update({"requests": [
@@ -797,13 +852,15 @@ def add_replacement_row_to_sheet(main_emp_id: int, replacer_emp_id: int,
                  bg=C_REPLACE, halign="LEFT", valign="MIDDLE"),
             _fmt(sid, new_row-1, new_row, 2, 3,
                  bg=C_REPLACE, halign="LEFT", valign="MIDDLE"),
-            _borders_light(sid, new_row-1, new_row, 0, n_cols),
+            _borders_all(sid, new_row-1, new_row, 0, n_cols, C_GRID_INNER),
+            # Объединяем план-смен (E) основного и замены
+            _merge(sid, main_row-1, new_row, 4, 5),
         ]})
     except Exception:
         pass
 
     # Обновляем row_map
-    rm = _load_row_map(year, month)
+    rm     = _load_row_map(year, month)
     new_rm = {eid: (r + 1 if r >= new_row else r) for eid, r in rm.items()}
     new_rm[str(replacer_emp_id)] = new_row
     _save_row_map(year, month, new_rm)
