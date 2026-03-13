@@ -1,6 +1,7 @@
 """
 Табель-бот — FastAPI + python-telegram-bot v20 (webhook mode)
 APScheduler — напоминания и авто-создание листа.
+v2.1
 """
 import logging
 import os
