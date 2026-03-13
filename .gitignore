@@ -7,3 +7,4 @@ db.json
 .row_map_*.json
 *.xlsx
 credentials.json
+.env

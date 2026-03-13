@@ -1319,6 +1319,8 @@ scheduler: AsyncIOScheduler = None  # type: ignore
 async def lifespan(app: FastAPI):
     global ptb_app, scheduler
 
+    db.init_db()
+
     ptb_app = Application.builder().token(BOT_TOKEN).build()
     setup_handlers(ptb_app)
     await ptb_app.initialize()
