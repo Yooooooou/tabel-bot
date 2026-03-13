@@ -84,6 +84,21 @@ def get_sheet_if_exists(year: int, month: int):
         return None
 
 
+def delete_sheet(year: int, month: int) -> bool:
+    """Удалить лист месяца из Google Sheets и кэш маппинга строк."""
+    sheet_name = f"{MONTH_NAMES_RU[month]} {year}"
+    sp = _get_spreadsheet()
+    try:
+        ws = sp.worksheet(sheet_name)
+        sp.del_worksheet(ws)
+    except gspread.WorksheetNotFound:
+        return False
+    row_map_file = f".row_map_{year}_{month:02d}.json"
+    if os.path.exists(row_map_file):
+        os.remove(row_map_file)
+    return True
+
+
 def _load_existing_sheet_state(year: int, month: int, total_days: int) -> dict:
     """
     Считывает уже проставленные смены/удержание/аванс из текущего листа

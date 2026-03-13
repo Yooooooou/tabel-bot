@@ -113,6 +113,7 @@ def kb_employees() -> InlineKeyboardMarkup:
         [InlineKeyboardButton("🔥 Уволить",               callback_data="emp:fire")],
         [InlineKeyboardButton("🗑 Удалить из базы",        callback_data="emp:delete")],
         [InlineKeyboardButton("📋 Список сотрудников",    callback_data="emp:list")],
+        [InlineKeyboardButton("🧹 Очистить всех сотрудников", callback_data="emp:clear")],
         [InlineKeyboardButton("🏠 Главное меню",          callback_data="nav:home")],
     ])
 
@@ -133,6 +134,7 @@ def kb_finance() -> InlineKeyboardMarkup:
 def kb_table() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("🆕 Создать / пересобрать таблицу", callback_data="table:build")],
+        [InlineKeyboardButton("🧹 Очистить таблицу",              callback_data="table:clear")],
         [InlineKeyboardButton("🏠 Главное меню",                   callback_data="nav:home")],
     ])
 
@@ -1105,13 +1107,43 @@ def conv_new_admin() -> ConversationHandler:
 
 
 # ════════════════════════════════════════════════════════════════════
+#  ОЧИСТКА ВСЕХ СОТРУДНИКОВ
+# ════════════════════════════════════════════════════════════════════
+
+async def cb_clear_employees_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Запрос подтверждения перед удалением всех сотрудников."""
+    q = update.callback_query
+    await q.answer()
+    await q.edit_message_text(
+        "⚠️ <b>Внимание!</b>\n\n"
+        "Вы собираетесь удалить <b>ВСЕХ</b> сотрудников из базы данных.\n"
+        "Это действие <b>необратимо</b>!\n\n"
+        "Данные в Google Sheets останутся без изменений.\n\n"
+        "Продолжить?",
+        parse_mode="HTML",
+        reply_markup=kb_yes_no("emp:clear_yes", "menu:employees"),
+    )
+
+
+async def cb_clear_employees_execute(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Выполнить удаление всех сотрудников."""
+    q = update.callback_query
+    await q.answer()
+    db.clear_all_employees()
+    await q.edit_message_text(
+        "✅ Все сотрудники удалены из базы данных.",
+        reply_markup=kb_home_repeat("👥 Сотрудники", "menu:employees"),
+    )
+
+
+# ════════════════════════════════════════════════════════════════════
 #  ТАБЛИЦА
 # ════════════════════════════════════════════════════════════════════
 
 async def cb_table_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
-    action = q.data.split(":")[1]   # build
+    action = q.data.split(":")[1]
 
     if action == "build":
         t = today_tz()
@@ -1129,6 +1161,36 @@ async def cb_table_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         except Exception as e:
             logger.exception("build_sheet error")
+            await q.edit_message_text(f"❌ Ошибка: {e}", reply_markup=kb_home())
+
+    elif action == "clear":
+        t = today_tz()
+        await q.edit_message_text(
+            f"⚠️ <b>Внимание!</b>\n\n"
+            f"Вы собираетесь <b>удалить лист</b> «{month_label(t.year, t.month)}» из Google Sheets.\n"
+            f"Все данные за этот месяц будут потеряны.\n\n"
+            f"Продолжить?",
+            parse_mode="HTML",
+            reply_markup=kb_yes_no("table:clear_yes", "menu:table"),
+        )
+
+    elif action == "clear_yes":
+        t = today_tz()
+        await q.edit_message_text(f"⏳ Удаляю лист «{month_label(t.year, t.month)}»…")
+        try:
+            deleted = sheets.delete_sheet(t.year, t.month)
+            if deleted:
+                await q.edit_message_text(
+                    f"✅ Лист «{month_label(t.year, t.month)}» удалён из Google Sheets.",
+                    reply_markup=kb_home_repeat("📊 Таблица", "menu:table"),
+                )
+            else:
+                await q.edit_message_text(
+                    f"ℹ️ Лист «{month_label(t.year, t.month)}» не найден.",
+                    reply_markup=kb_home_repeat("📊 Таблица", "menu:table"),
+                )
+        except Exception as e:
+            logger.exception("delete_sheet error")
             await q.edit_message_text(f"❌ Ошибка: {e}", reply_markup=kb_home())
 
 
@@ -1233,6 +1295,10 @@ def setup_handlers(app: Application):
 
     # Список сотрудников
     app.add_handler(CallbackQueryHandler(cb_emp_list, pattern="^emp:list$"))
+
+    # Очистка сотрудников
+    app.add_handler(CallbackQueryHandler(cb_clear_employees_confirm, pattern="^emp:clear$"))
+    app.add_handler(CallbackQueryHandler(cb_clear_employees_execute, pattern="^emp:clear_yes$"))
 
     # Таблица
     app.add_handler(CallbackQueryHandler(cb_table_action, pattern="^table:"))
