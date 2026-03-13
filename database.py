@@ -314,3 +314,16 @@ def remove_bot_admin(chat_id: int):
     db = _load()
     db["admins"] = [a for a in db["admins"] if a != chat_id]
     _save(db)
+
+
+def clear_all_employees():
+    """Удалить всех сотрудников из базы."""
+    if _USE_PG:
+        with _pg_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("DELETE FROM employees")
+            conn.commit()
+        return
+    db = _load()
+    db["employees"] = []
+    _save(db)

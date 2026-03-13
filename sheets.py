@@ -88,6 +88,21 @@ def recreate_sheet(year: int, month: int):
     return ws
 
 
+def delete_sheet(year: int, month: int) -> bool:
+    """Удалить лист месяца из Google Sheets и кэш маппинга строк."""
+    sheet_name = f"{MONTH_NAMES_RU[month]} {year}"
+    sp = _get_spreadsheet()
+    try:
+        ws = sp.worksheet(sheet_name)
+        sp.del_worksheet(ws)
+    except gspread.WorksheetNotFound:
+        return False
+    path = _row_map_file(year, month)
+    if os.path.exists(path):
+        os.remove(path)
+    return True
+
+
 def get_sheet_if_exists(year: int, month: int):
     sheet_name = f"{MONTH_NAMES_RU[month]} {year}"
     sp = _get_spreadsheet()

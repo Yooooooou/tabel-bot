@@ -144,6 +144,32 @@ async def cb_emp_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
                               reply_markup=kb_home_repeat("👥 Сотрудники", "menu:employees"))
 
 
+# ─── Очистить всех сотрудников ────────────────────────────────────────────────
+
+async def cb_clear_employees_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    await q.edit_message_text(
+        "🧹 Удалить <b>всех</b> сотрудников из базы?\n"
+        "Это действие нельзя отменить.",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("✅ Да, удалить всех", callback_data="emp:clear_yes")],
+            [InlineKeyboardButton("❌ Отмена",           callback_data="menu:employees")],
+        ])
+    )
+
+
+async def cb_clear_employees_execute(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    db.clear_all_employees()
+    await q.edit_message_text(
+        "✅ Все сотрудники удалены.",
+        reply_markup=kb_home_repeat("👥 Сотрудники", "menu:employees")
+    )
+
+
 # ─── Таблица ──────────────────────────────────────────────────────────────────
 
 async def cb_table_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -167,6 +193,37 @@ async def cb_table_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         except Exception as e:
             logger.exception("build_sheet error")
+            await q.edit_message_text(f"❌ Ошибка: {e}", reply_markup=kb_home())
+
+    elif action == "clear":
+        t = today_tz()
+        await q.edit_message_text(
+            f"🧹 Удалить лист <b>{month_label(t.year, t.month)}</b>?\n"
+            f"Это действие нельзя отменить.",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("✅ Да, удалить", callback_data="table:clear_yes")],
+                [InlineKeyboardButton("❌ Отмена",      callback_data="nav:home")],
+            ])
+        )
+
+    elif action == "clear_yes":
+        t = today_tz()
+        try:
+            deleted = sheets.delete_sheet(t.year, t.month)
+            if deleted:
+                await q.edit_message_text(
+                    f"✅ Лист <b>{month_label(t.year, t.month)}</b> удалён.",
+                    parse_mode="HTML",
+                    reply_markup=kb_home_repeat("📊 Таблица", "menu:table")
+                )
+            else:
+                await q.edit_message_text(
+                    f"⚠️ Лист не найден.",
+                    reply_markup=kb_home_repeat("📊 Таблица", "menu:table")
+                )
+        except Exception as e:
+            logger.exception("delete_sheet error")
             await q.edit_message_text(f"❌ Ошибка: {e}", reply_markup=kb_home())
 
 
@@ -279,6 +336,10 @@ def setup_handlers(app: Application):
 
     # Список сотрудников
     app.add_handler(CallbackQueryHandler(cb_emp_list, pattern="^emp:list$"))
+
+    # Очистить всех сотрудников
+    app.add_handler(CallbackQueryHandler(cb_clear_employees_confirm, pattern="^emp:clear$"))
+    app.add_handler(CallbackQueryHandler(cb_clear_employees_execute, pattern="^emp:clear_yes$"))
 
     # Таблица
     app.add_handler(CallbackQueryHandler(cb_table_action, pattern="^table:"))

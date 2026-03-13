@@ -55,12 +55,13 @@ def kb_home_repeat(repeat_label: str, repeat_data: str) -> InlineKeyboardMarkup:
 
 def kb_employees() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("➕ Добавить сотрудника",  callback_data="emp:add")],
-        [InlineKeyboardButton("✏️ Редактировать",         callback_data="emp:edit")],
-        [InlineKeyboardButton("🔥 Уволить",               callback_data="emp:fire")],
-        [InlineKeyboardButton("🗑 Удалить из базы",        callback_data="emp:delete")],
-        [InlineKeyboardButton("📋 Список сотрудников",    callback_data="emp:list")],
-        [InlineKeyboardButton("🏠 Главное меню",          callback_data="nav:home")],
+        [InlineKeyboardButton("➕ Добавить сотрудника",       callback_data="emp:add")],
+        [InlineKeyboardButton("✏️ Редактировать",              callback_data="emp:edit")],
+        [InlineKeyboardButton("🔥 Уволить",                    callback_data="emp:fire")],
+        [InlineKeyboardButton("🗑 Удалить из базы",             callback_data="emp:delete")],
+        [InlineKeyboardButton("📋 Список сотрудников",         callback_data="emp:list")],
+        [InlineKeyboardButton("🧹 Очистить всех сотрудников",  callback_data="emp:clear")],
+        [InlineKeyboardButton("🏠 Главное меню",               callback_data="nav:home")],
     ])
 
 
@@ -84,6 +85,7 @@ def kb_finance() -> InlineKeyboardMarkup:
 def kb_table() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("🆕 Создать / пересобрать таблицу", callback_data="table:build")],
+        [InlineKeyboardButton("🧹 Очистить таблицу",              callback_data="table:clear")],
         [InlineKeyboardButton("🏠 Главное меню",                   callback_data="nav:home")],
     ])
 
